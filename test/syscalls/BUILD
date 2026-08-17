@@ -544,6 +544,10 @@ syscall_test(
 )
 
 syscall_test(
+    test = "//test/syscalls/linux:perf_event_open_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:pidfd_test",
 )
 

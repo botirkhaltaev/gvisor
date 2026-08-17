@@ -1994,6 +1994,19 @@ cc_binary(
 )
 
 cc_binary(
+    name = "perf_event_open_test",
+    testonly = 1,
+    srcs = ["perf_event_open.cc"],
+    linkstatic = 1,
+    malloc = "//test/util:errno_safe_allocator",
+    deps = select_gtest() + [
+        "//test/util:file_descriptor",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
     name = "ping_socket_test",
     testonly = 1,
     srcs = ["ping_socket.cc"],

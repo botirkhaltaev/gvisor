@@ -17,6 +17,7 @@ package kernel
 import (
 	gocontext "context"
 	"runtime/trace"
+	"sync"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -639,6 +640,12 @@ type Task struct {
 	//
 	// kcov is exclusive to the task goroutine.
 	kcov *Kcov
+
+	// perfMu protects perfEvents.
+	perfMu sync.Mutex `state:"nosave"`
+
+	// perfEvents lists software perf events attached to this task.
+	perfEvents []*PerfEvent
 
 	// cgroups is the set of cgroups this task belongs to. This may be empty if
 	// no cgroup controllers are enabled. Protected by mu.
