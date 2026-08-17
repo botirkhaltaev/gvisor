@@ -64,6 +64,7 @@ go_library(
         "nf_tables.go",
         "personality.go",
         "pidfd.go",
+        "perf_event.go",
         "poll.go",
         "prctl.go",
         "ptrace.go",
