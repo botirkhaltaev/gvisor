@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 )
 
@@ -67,7 +68,13 @@ func (o *object) Object() *object {
 // those objects also results in the freeing of the recorded object.
 //
 // Precondition: client.objsMu must be locked.
-func (nvp *nvproxy) objAdd(ctx context.Context, client *rootClient, h nvgpu.Handle, c nvgpu.ClassID, oi objectImpl, parentH nvgpu.Handle, deps ...nvgpu.Handle) {
+func (nvp *nvproxy) objAdd(ctx context.Context, fd *frontendFD, client *rootClient, h nvgpu.Handle, c nvgpu.ClassID, oi objectImpl, parentH nvgpu.Handle, deps ...nvgpu.Handle) {
+	nvp.objAddWithProcessSource(ctx, fd, client, h, c, oi, parentH, nil, deps...)
+}
+
+// Precondition: client.objsMu must be locked. If source is non-nil, its
+// client's objsMu must also be locked.
+func (nvp *nvproxy) objAddWithProcessSource(ctx context.Context, fd *frontendFD, client *rootClient, h nvgpu.Handle, c nvgpu.ClassID, oi objectImpl, parentH nvgpu.Handle, source *object, deps ...nvgpu.Handle) {
 	if h.Val == nvgpu.NV01_NULL_OBJECT {
 		log.Traceback("nvproxy: new object (class %v) has invalid handle %v", c, h)
 		return
@@ -105,6 +112,7 @@ func (nvp *nvproxy) objAdd(ctx context.Context, client *rootClient, h nvgpu.Hand
 		objDep(o, dep)
 	}
 
+	nvp.trackProcessObject(fd, o, source)
 	if ctx.IsLogging(log.Debug) {
 		ctx.Debugf("nvproxy: added object %v:%v (class %v) with parent %v, dependencies %v", client.handle, h, c, parentH, deps)
 	}
@@ -160,7 +168,7 @@ func (nvp *nvproxy) objDup(ctx context.Context, clientDst, clientSrc *rootClient
 		return
 	}
 	oDst := &miscObject{}
-	nvp.objAdd(ctx, clientDst, dstH, oSrc.class, oDst, parentDstH)
+	nvp.objAddWithProcessSource(ctx, nil, clientDst, dstH, oSrc.class, oDst, parentDstH, oSrc)
 	parentSrc := clientSrc.getObject(ctx, oSrc.parent)
 	// Copy all non-parent dependencies.
 	for dep := range oSrc.deps {
@@ -267,6 +275,7 @@ func (nvp *nvproxy) objFree(ctx context.Context, client *rootClient, h nvgpu.Han
 	var deferReleases []func()
 	for !client.objsFreeList.Empty() {
 		o2 := client.objsFreeList.Front()
+		nvp.untrackProcessObject(o2)
 		deferRelease := o2.impl.Release(ctx)
 		if deferRelease != nil {
 			deferReleases = append(deferReleases, deferRelease)
@@ -372,6 +381,10 @@ func (o *miscObject) Release(ctx context.Context) func() {
 type rootClient struct {
 	object
 
+	// creator is the immutable identity of the process that created the RM
+	// client. Descriptor sharing does not transfer the driver's attribution.
+	creator *kernel.ThreadGroup
+
 	objsMu objsMutex `state:"nosave"`
 	// These fields are protected by objsMu.
 	objsFreeList objectFreeList       `state:"nosave"`
@@ -382,10 +395,15 @@ type rootClient struct {
 	params capturedRmAllocParams
 }
 
-func newRootClient[Params any](fd *frontendFD, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params) *rootClient {
+func newRootClient[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params) *rootClient {
+	var creator *kernel.ThreadGroup
+	if fi.fd.dev.nvp.abi.processAccounting {
+		creator = fi.t.ThreadGroup()
+	}
 	return &rootClient{
+		creator:   creator,
 		resources: make(map[nvgpu.Handle]*object),
-		params:    captureRmAllocParams(fd, ioctlParams, rightsRequested, allocParams),
+		params:    captureRmAllocParams(fi.fd, ioctlParams, rightsRequested, allocParams),
 	}
 }
 

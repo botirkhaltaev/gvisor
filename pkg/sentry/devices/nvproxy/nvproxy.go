@@ -22,6 +22,8 @@
 // - nvproxy.fdsMu
 // - rootClient.objsMu
 //   - nvproxy.clientsMu
+//   - nvproxy.processMu is acquired after rootClient.objsMu and is not held
+//     while resolving task identities or acquiring another nvproxy lock.
 package nvproxy
 
 import (
@@ -236,6 +238,12 @@ type nvproxy struct {
 
 	clientsMu sync.RWMutex `state:"nosave"`
 	clients   map[nvgpu.Handle]*rootClient
+
+	processMu processMutex `state:"nosave"`
+	// +checklocks:processMu
+	processObjects map[*object]*gpuProcessObject
+	// +checklocks:processMu
+	processAccountingIncomplete bool
 }
 
 func nvproxyFromVFS(vfsObj *vfs.VirtualFilesystem) *nvproxy {

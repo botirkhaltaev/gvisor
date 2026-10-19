@@ -93,6 +93,8 @@ type driverABI struct {
 	uvmIoctl        map[uint32]uvmIoctlHandler
 	controlCmd      map[uint32]controlCmdHandler
 	allocationClass map[nvgpu.ClassID]allocationClassHandler
+	// processAccounting requires exact per-object byte-size queries.
+	processAccounting bool
 
 	getInfo driverABIInfoFunc // lazy constructor for the DriverABIInfo
 }
@@ -1270,6 +1272,16 @@ func Init() {
 		v610_57_04 := addDriverABI(610, 57, 04, "b2e935c66b83bb00c0c857bc8e0ee0fd52de9286b40c9cc1eec29a7ce7eb116d", "40279facc0429a93b0b8ec97bf59391a3d2207609894f8271b7253a14c3f8f9e", func() *driverABI {
 			abi := v610_43_02()
 			abi.frontendIoctl[nvgpu.NV_ESC_RM_VID_HEAP_CONTROL] = feHandler(rmVidHeapControlWithOSDescriptor, compUtil)
+			abi.processAccounting = true
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GPU_GET_PIDS] = ctrlHandler(ctrlGpuGetPids, compUtil)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_GPU_GET_PID_INFO] = ctrlHandler(ctrlGpuGetPidInfo, compUtil)
+			prevGetInfo := abi.getInfo
+			abi.getInfo = func() *DriverABIInfo {
+				info := prevGetInfo()
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_GPU_GET_PIDS] = ioctlInfo("NV2080_CTRL_CMD_GPU_GET_PIDS", nvgpu.NV2080_CTRL_GPU_GET_PIDS_PARAMS{})
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_GPU_GET_PID_INFO] = ioctlInfo("NV2080_CTRL_CMD_GPU_GET_PID_INFO", nvgpu.NV2080_CTRL_GPU_GET_PID_INFO_PARAMS{}, nvgpu.NV2080_CTRL_GPU_PID_INFO{}, nvgpu.NV2080_CTRL_SMC_SUBSCRIPTION_INFO{}, nvgpu.NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA{})
+				return info
+			}
 			return abi
 		})
 

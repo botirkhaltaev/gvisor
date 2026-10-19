@@ -21,6 +21,13 @@ declare_mutex(
 )
 
 declare_mutex(
+    name = "process_mutex",
+    out = "process_mutex.go",
+    package = "nvproxy",
+    prefix = "process",
+)
+
+declare_mutex(
     name = "objs_mutex",
     out = "objs_mutex.go",
     package = "nvproxy",
@@ -55,6 +62,10 @@ go_library(
         "object_free_list.go",
         "objs_mutex.go",
         "open_only.go",
+        "process.go",
+        "process_memory.go",
+        "process_mutex.go",
+        "process_unsafe.go",
         "procfs.go",
         "save_restore.go",
         "save_restore_unsafe.go",
@@ -109,6 +120,29 @@ go_test(
         "//pkg/seccomp",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "process_test",
+    srcs = ["process_test.go"],
+    library = ":nvproxy",
+    deps = [
+        "//pkg/abi/nvgpu",
+        "//pkg/context",
+        "//pkg/sentry/devices/nvproxy/nvconf",
+        "//pkg/sentry/kernel",
+        "//pkg/state",
+    ],
+)
+
+go_test(
+    name = "process_memory_test",
+    srcs = ["process_memory_test.go"],
+    library = ":nvproxy",
+    deps = [
+        "//pkg/abi/nvgpu",
+        "//pkg/state",
     ],
 )
 

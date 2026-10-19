@@ -507,7 +507,7 @@ func rmVidHeapControlAllocSize(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS32
 		// src/nvidia/interface/deprecated/rmapi_deprecated_vidheapctrl.c:_rmVidHeapControlAllocCommon()
 		if allocSizeParams.Flags&nvgpu.NVOS32_ALLOC_FLAGS_VIRTUAL != 0 {
 			// src/nvidia/src/kernel/mem_mgr/virtual_mem.c:virtmemConstruct_IMPL() => refAddDependant()
-			fi.fd.dev.nvp.objAdd(fi.ctx, client, allocSizeParams.HMemory, nvgpu.NV50_MEMORY_VIRTUAL, &miscObject{}, ioctlParams.HObjectParent, ioctlParams.HVASpace)
+			fi.fd.dev.nvp.objAdd(fi.ctx, fi.fd, client, allocSizeParams.HMemory, nvgpu.NV50_MEMORY_VIRTUAL, &miscObject{}, ioctlParams.HObjectParent, ioctlParams.HVASpace)
 		} else {
 			classID := nvgpu.ClassID(nvgpu.NV01_MEMORY_SYSTEM)
 			if (allocSizeParams.Attr2>>nvgpu.NVOS32_ATTR2_USE_EGM_SHIFT)&nvgpu.NVOS32_ATTR2_USE_EGM_MASK == nvgpu.NVOS32_ATTR2_USE_EGM_TRUE {
@@ -515,7 +515,7 @@ func rmVidHeapControlAllocSize(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS32
 			} else if (allocSizeParams.Attr>>nvgpu.NVOS32_ATTR_LOCATION_SHIFT)&nvgpu.NVOS32_ATTR_LOCATION_MASK == nvgpu.NVOS32_ATTR_LOCATION_VIDMEM {
 				classID = nvgpu.NV01_MEMORY_LOCAL_USER
 			}
-			fi.fd.dev.nvp.objAdd(fi.ctx, client, allocSizeParams.HMemory, classID, &miscObject{}, ioctlParams.HObjectParent)
+			fi.fd.dev.nvp.objAdd(fi.ctx, fi.fd, client, allocSizeParams.HMemory, classID, &miscObject{}, ioctlParams.HObjectParent)
 		}
 	}
 	unlock()
@@ -565,7 +565,7 @@ func rmVidHeapControlAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgp
 	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
 		// The driver returns the handle in HMemory, including when it
 		// generated the handle.
-		fi.fd.dev.nvp.objAdd(fi.ctx, client, allocOSDescParams.HMemory, nvgpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, obj, ioctlParams.HObjectParent)
+		fi.fd.dev.nvp.objAdd(fi.ctx, fi.fd, client, allocOSDescParams.HMemory, nvgpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, obj, ioctlParams.HObjectParent)
 		releaseObj.Release()
 		if fi.ctx.IsLogging(log.Debug) {
 			fi.ctx.Debugf("nvproxy: pinned %d bytes for OS descriptor with handle %v", allocOSDescParams.Limit+1, allocOSDescParams.HMemory)

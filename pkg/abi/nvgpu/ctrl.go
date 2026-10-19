@@ -367,7 +367,9 @@ const (
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl0041.h
 const (
-	NV0041_CTRL_CMD_GET_SURFACE_INFO = 0x410110
+	NV0041_CTRL_CMD_GET_SURFACE_INFO            = 0x410110
+	NV0041_CTRL_SURFACE_INFO_INDEX_PHYS_SIZE_LO = 0x2
+	NV0041_CTRL_SURFACE_INFO_INDEX_PHYS_SIZE_HI = 0x3
 )
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080fb.h:
@@ -693,6 +695,86 @@ const (
 	NV2080_CTRL_CMD_GPU_GET_RECOVERY_ACTION              = 0x208001b2
 	NV2080_CTRL_CMD_GPU_EXEC_REG_OPS                     = 0x20800122
 )
+
+// NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA contains the driver's
+// private, shared-owned, and shared-duplicated memory totals, in bytes.
+//
+// +marshal
+type NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA struct {
+	_                       structs.HostLayout
+	MemPrivate              uint64
+	MemSharedOwned          uint64
+	MemSharedDuped          uint64
+	ProtectedMemPrivate     uint64
+	ProtectedMemSharedOwned uint64
+	ProtectedMemSharedDuped uint64
+}
+
+// NV2080_CTRL_GPU_PID_INFO_DATA is opaque storage for the driver's PID-info
+// data union. Its uint64 backing preserves the union's 8-byte alignment.
+//
+// +marshal
+type NV2080_CTRL_GPU_PID_INFO_DATA struct {
+	Raw [6]uint64
+}
+
+const (
+	NV2080_CTRL_GPU_GET_PIDS_MAX_COUNT                = 950
+	NV2080_CTRL_GPU_GET_PID_INFO_MAX_COUNT            = 200
+	NV2080_CTRL_GPU_GET_PIDS_ID_TYPE_CLASS            = 0
+	NV2080_CTRL_GPU_PID_INFO_INDEX_VIDEO_MEMORY_USAGE = 0
+)
+
+// +marshal
+type NV2080_CTRL_GPU_GET_PIDS_PARAMS struct {
+	_           structs.HostLayout
+	IDType      uint32
+	ID          uint32
+	PIDTblCount uint32
+	PIDTbl      [NV2080_CTRL_GPU_GET_PIDS_MAX_COUNT]uint32
+}
+
+// +marshal
+type NV2080_CTRL_SMC_SUBSCRIPTION_INFO struct {
+	_                 structs.HostLayout
+	ComputeInstanceID uint32
+	GPUInstanceID     uint32
+}
+
+// +marshal
+type NV2080_CTRL_GPU_PID_INFO struct {
+	_               structs.HostLayout
+	PID             uint32
+	Index           uint32
+	Result          uint32
+	Pad             [4]byte
+	Data            NV2080_CTRL_GPU_PID_INFO_DATA
+	SMCSubscription NV2080_CTRL_SMC_SUBSCRIPTION_INFO
+}
+
+// VideoMemoryUsage decodes video-memory usage from the PID-info data union.
+func (p *NV2080_CTRL_GPU_PID_INFO) VideoMemoryUsage() NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA {
+	var data NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA
+	var buf [48]byte
+	p.Data.MarshalBytes(buf[:])
+	data.UnmarshalBytes(buf[:])
+	return data
+}
+
+// SetVideoMemoryUsage encodes video-memory usage into the PID-info data union.
+func (p *NV2080_CTRL_GPU_PID_INFO) SetVideoMemoryUsage(data NV2080_CTRL_GPU_PID_INFO_VIDEO_MEMORY_USAGE_DATA) {
+	var buf [48]byte
+	data.MarshalBytes(buf[:])
+	p.Data.UnmarshalBytes(buf[:])
+}
+
+// +marshal
+type NV2080_CTRL_GPU_GET_PID_INFO_PARAMS struct {
+	_                structs.HostLayout
+	PIDInfoListCount uint32
+	Pad              [4]byte
+	PIDInfoList      [NV2080_CTRL_GPU_GET_PID_INFO_MAX_COUNT]NV2080_CTRL_GPU_PID_INFO
+}
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h:
 const (
