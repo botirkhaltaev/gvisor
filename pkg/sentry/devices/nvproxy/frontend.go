@@ -1663,7 +1663,7 @@ func rmAllocMNCCSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 	allocParams.CapDescriptor = uint64(capsFile.hostFD)
 
 	n, err := rmAllocInvoke(fi, ioctlParams, &allocParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV77CC_ALLOC_PARAMETERS) {
-		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, &miscObject{}, ioctlParams.HObjectParent)
+		fi.fd.dev.nvp.objAdd(fi.ctx, fi.fd, client, ioctlParams.HObjectNew, ioctlParams.HClass, &miscObject{}, ioctlParams.HObjectParent)
 	})
 	if err != nil {
 		return n, err
