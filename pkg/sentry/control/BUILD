@@ -95,6 +95,7 @@ go_test(
     srcs = [
         "fs_test.go",
         "proc_test.go",
+        "state_cuda_test.go",
         "state_test.go",
         "usage_test.go",
     ],
