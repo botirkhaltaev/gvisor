@@ -16,6 +16,7 @@ package vfs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -26,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -130,6 +132,14 @@ func TestFailedAsyncRegistrationCleanup(t *testing.T) {
 			}
 		})
 	}
+}
+
+type unsavableFileDescription struct {
+	FileDescriptionImpl
+}
+
+func (*unsavableFileDescription) CheckSave() error {
+	return fmt.Errorf("test file description: %w", state.ErrUnsavable)
 }
 
 func TestGenCountFD(t *testing.T) {
@@ -247,5 +257,12 @@ func TestWritable(t *testing.T) {
 	}
 	if n, err := fd.PWrite(ctx, writeIOSeq, 2, WriteOptions{}); n != 0 && !linuxerr.Equals(linuxerr.EINVAL, err) {
 		t.Errorf("PWrite: got err (%v, %v), wanted (0, EINVAL)", n, err)
+	}
+}
+
+func TestSaveUnsavableFileDescription(t *testing.T) {
+	fd := FileDescription{impl: &unsavableFileDescription{}}
+	if _, err := state.Save(t.Context(), io.Discard, &fd); !errors.Is(err, state.ErrUnsavable) {
+		t.Fatalf("state.Save = %v, want errors.Is(err, state.ErrUnsavable)", err)
 	}
 }
