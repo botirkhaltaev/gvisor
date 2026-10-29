@@ -19,13 +19,18 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
-func hostFilePagesResidentForRead(fd int, offset, length int64) bool {
+// hostFilePagesResidentForRead is a snapshot; pages can be evicted before the
+// read, so a resident result does not guarantee non-blocking host I/O.
+func hostFilePagesResidentForRead(ctx context.Context, fd int, offset, length int64) bool {
 	if offset < 0 || length <= 0 || length > 1<<30 {
 		return false
 	}
+	ctx.UninterruptibleSleepStart()
+	defer ctx.UninterruptibleSleepFinish()
 	aligned := offset &^ int64(hostarch.PageSize-1)
 	mapLength := int(length + offset - aligned)
 	mapping, err := unix.Mmap(fd, aligned, mapLength, unix.PROT_READ, unix.MAP_PRIVATE)

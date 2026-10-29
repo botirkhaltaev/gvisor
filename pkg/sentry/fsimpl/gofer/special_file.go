@@ -277,14 +277,14 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	var err error
 	nonDirectRegularFile := fd.isRegularFile && fd.vfsfd.StatusFlags()&linux.O_DIRECT == 0
 	if nonDirectRegularFile && dst.NumBytes() > regularReadBufferThreshold &&
-		(fd.handle.fd < 0 || !hostFilePagesResidentForRead(int(fd.handle.fd), offset, dst.NumBytes())) {
+		(fd.handle.fd < 0 || !hostFilePagesResidentForRead(ctx, int(fd.handle.fd), offset, dst.NumBytes())) {
 		// CopyOutFrom holds the process memory lock across the reader callback.
 		// A host filesystem read can block on remote storage, preventing other
 		// threads from faulting in unrelated memory until the read completes.
 		// Read into a bounded buffer before acquiring application mappings.
 		storage := regularReadBufferPool.Get().(*[regularReadBufferSize]byte)
 		defer regularReadBufferPool.Put(storage)
-		buf := storage[:min(dst.NumBytes(), int64(len(storage)))]
+		buf := storage[:]
 		for dst.NumBytes() != 0 {
 			want := min(dst.NumBytes(), int64(len(buf)))
 			nr, readErr := rw.ReadToBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:want])))
@@ -309,6 +309,11 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		n, err = dst.CopyOutFrom(ctx, rw)
 	}
 	putHandleReadWriter(rw)
+	if nonDirectRegularFile && bufN+n > 0 {
+		// An error after a completed chunk is reported by the next read at
+		// the returned offset. Linux returns the bytes read so far.
+		err = nil
+	}
 	if linuxerr.Equals(linuxerr.EAGAIN, err) {
 		err = linuxerr.ErrWouldBlock
 	}
