@@ -76,6 +76,11 @@ type IO interface {
 	//		any preceding locks in the lock order.
 	CopyOutFrom(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts IOOpts) (int64, error)
 
+	// CopyOutFromIter is like CopyOutFrom, but may call src.ReadToBlocks
+	// multiple times. src must advance by the number of bytes returned by
+	// each call. chunkSize is a suggested maximum size for each call.
+	CopyOutFromIter(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts IOOpts, chunkSize int64) (int64, error)
+
 	// CopyInTo copies ars.NumBytes() bytes from the memory mapped at ars to
 	// dst. It returns the number of bytes copied. CopyInTo may return a
 	// partial copy without an error iff dst.WriteFromBlocks returns a partial
@@ -502,6 +507,13 @@ func (s IOSequence) ZeroOut(ctx context.Context, toZero int64) (int64, error) {
 // Preconditions: Same as IO.CopyOutFrom.
 func (s IOSequence) CopyOutFrom(ctx context.Context, src safemem.Reader) (int64, error) {
 	return s.IO.CopyOutFrom(ctx, s.Addrs, src, s.Opts)
+}
+
+// CopyOutFromIter invokes s.IO.CopyOutFromIter over s.Addrs.
+//
+// Preconditions: Same as IO.CopyOutFromIter.
+func (s IOSequence) CopyOutFromIter(ctx context.Context, src safemem.Reader, chunkSize int64) (int64, error) {
+	return s.IO.CopyOutFromIter(ctx, s.Addrs, src, s.Opts, chunkSize)
 }
 
 // CopyInTo invokes s.CopyInTo over s.Addrs.
