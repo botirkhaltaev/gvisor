@@ -32,7 +32,7 @@ func hostFilePagesResidentForRead(ctx context.Context, fd int, offset, length in
 	ctx.UninterruptibleSleepStart()
 	defer ctx.UninterruptibleSleepFinish()
 	aligned := offset &^ int64(hostarch.PageSize-1)
-	mapLength := int(length + offset - aligned)
+	mapLength := int(length + (offset - aligned))
 	mapping, err := unix.Mmap(fd, aligned, mapLength, unix.PROT_READ, unix.MAP_PRIVATE)
 	if err != nil {
 		return false
