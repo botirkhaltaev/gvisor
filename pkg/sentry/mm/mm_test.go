@@ -248,12 +248,13 @@ func TestCopyOutFromIter(t *testing.T) {
 	if n, err := mm.CopyOutFrom(ctx, ars, regular, usermem.IOOpts{}); n != size || err != nil || regular.calls != 1 {
 		t.Fatalf("regular copy: n=%d err=%v calls=%d", n, err, regular.calls)
 	}
-	iter := &advancingTestReader{data: data}
+	iterData := bytes.Repeat([]byte{0xa5}, size)
+	iter := &advancingTestReader{data: iterData}
 	if n, err := mm.CopyOutFromIter(ctx, ars, iter, usermem.IOOpts{}, chunkSize); n != size || err != nil || iter.calls != 2 {
 		t.Fatalf("iterative copy: n=%d err=%v calls=%d", n, err, iter.calls)
 	}
 	got := make([]byte, size)
-	if n, err := mm.CopyIn(ctx, addr, got, usermem.IOOpts{}); n != size || err != nil || !bytes.Equal(got, data) {
+	if n, err := mm.CopyIn(ctx, addr, got, usermem.IOOpts{}); n != size || err != nil || !bytes.Equal(got, iterData) {
 		t.Fatalf("copied data differs: n=%d err=%v", n, err)
 	}
 	invalid := hostarch.AddrRangeSeqOf(hostarch.AddrRange{Start: addr, End: addr + size + pageSizeAddr})

@@ -78,7 +78,10 @@ type IO interface {
 
 	// CopyOutFromIter is like CopyOutFrom, but may call src.ReadToBlocks
 	// multiple times. src must advance by the number of bytes returned by
-	// each call. chunkSize is a suggested maximum size for each call.
+	// each call. chunkSize is a suggested maximum size for each call;
+	// implementations may call src only once.
+	//
+	// Preconditions: Same as CopyOutFrom.
 	CopyOutFromIter(ctx context.Context, ars hostarch.AddrRangeSeq, src safemem.Reader, opts IOOpts, chunkSize int64) (int64, error)
 
 	// CopyInTo copies ars.NumBytes() bytes from the memory mapped at ars to

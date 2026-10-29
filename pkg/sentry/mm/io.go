@@ -368,7 +368,7 @@ func (mm *MemoryManager) CopyOutFromIter(ctx context.Context, ars hostarch.AddrR
 			if ar.Length() == 0 {
 				continue
 			}
-			if n, err := mm.EnsurePMAsExist(ctx, ar.Start, int64(ar.Length()), opts); err != nil || n != int64(ar.Length()) {
+			if !mm.prepareWritePMAs(ctx, ar, opts) {
 				n, err := mm.CopyOutFrom(ctx, ars, src, opts)
 				return done + n, err
 			}
@@ -385,6 +385,25 @@ func (mm *MemoryManager) CopyOutFromIter(ctx context.Context, ars hostarch.AddrR
 		}
 	}
 	return done, nil
+}
+
+// prepareWritePMAs populates destination PMAs without acquiring writable
+// internal mappings, which could flush untouched buffered I/O fallback pages.
+//
+// +checklocksexclude:mm.mappingMu
+// +checklocksexclude:mm.activeMu
+func (mm *MemoryManager) prepareWritePMAs(ctx context.Context, ar hostarch.AddrRange, opts usermem.IOOpts) bool {
+	mm.mappingMu.RLock()
+	vseg, _, err := mm.getVMAsLocked(ctx, ar, hostarch.Write, opts.IgnorePermissions)
+	if err != nil {
+		mm.mappingMu.RUnlock()
+		return false
+	}
+	mm.activeMu.Lock()
+	_, pend, err := mm.getPMAsLocked(ctx, vseg, ar, hostarch.Write, true /* callerIndirectCommit */, false /* forPin */)
+	mm.activeMu.Unlock()
+	mm.mappingMu.RUnlock()
+	return err == nil && pend.Start() >= ar.End
 }
 
 // CopyInTo implements usermem.IO.CopyInTo.

@@ -280,7 +280,7 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		(fd.handle.fd < 0 || !hostFilePagesResidentForRead(ctx, int(fd.handle.fd), offset, dst.NumBytes())) {
 		// Host I/O may block while CopyOutFrom holds the process memory lock.
 		// Without a host FD, treat residency as unknown and stage the read.
-		storage := regularReadBufferPool.Get().(*[regularReadBufferSize]byte)
+		storage := regularReadBufferPool.Get().(*[regularReadChunkSize]byte)
 		defer regularReadBufferPool.Put(storage)
 		buf := storage[:]
 		for dst.NumBytes() != 0 {
