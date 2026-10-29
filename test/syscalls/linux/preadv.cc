@@ -73,6 +73,10 @@ TEST(PreadvTest, LargeTmpfsReadAcrossVectors) {
   EXPECT_EQ(std::memcmp(m.ptr(), data.data() + kSize - kFirstVectorSize,
                         kFirstVectorSize),
             0);
+  EXPECT_EQ(std::memcmp(static_cast<char*>(m.ptr()) + kFirstVectorSize,
+                        data.data() + kFirstVectorSize,
+                        kSize - kFirstVectorSize),
+            0);
 }
 
 // Stress copy-on-write. Attempts to reproduce b/38430174.

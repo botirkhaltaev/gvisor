@@ -596,6 +596,9 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	n, err := dst.CopyOutFromIter(ctx, rw, 4<<20)
 	putRegularFileReadWriter(rw)
 	fd.inode().touchAtime(fd.vfsfd.Mount())
+	if n > 0 && err == io.EOF {
+		err = nil
+	}
 	return n, err
 }
 
