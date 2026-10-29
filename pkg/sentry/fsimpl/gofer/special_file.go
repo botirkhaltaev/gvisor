@@ -211,13 +211,13 @@ func (fd *specialFileFD) Allocate(ctx context.Context, mode, offset, length uint
 }
 
 const (
+	// Small reads use the direct path to avoid the extra staging copy.
 	regularReadBufferThreshold = 64 << 20
-	regularReadBufferSize      = 1 << 20
 	regularReadChunkSize       = 1 << 20
 )
 
 var regularReadBufferPool = sync.Pool{
-	New: func() any { return new([regularReadBufferSize]byte) },
+	New: func() any { return new([regularReadChunkSize]byte) },
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -278,10 +278,8 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	nonDirectRegularFile := fd.isRegularFile && fd.vfsfd.StatusFlags()&linux.O_DIRECT == 0
 	if nonDirectRegularFile && dst.NumBytes() > regularReadBufferThreshold &&
 		(fd.handle.fd < 0 || !hostFilePagesResidentForRead(ctx, int(fd.handle.fd), offset, dst.NumBytes())) {
-		// CopyOutFrom holds the process memory lock across the reader callback.
-		// A host filesystem read can block on remote storage, preventing other
-		// threads from faulting in unrelated memory until the read completes.
-		// Read into a bounded buffer before acquiring application mappings.
+		// Host I/O may block while CopyOutFrom holds the process memory lock.
+		// Without a host FD, treat residency as unknown and stage the read.
 		storage := regularReadBufferPool.Get().(*[regularReadBufferSize]byte)
 		defer regularReadBufferPool.Put(storage)
 		buf := storage[:]

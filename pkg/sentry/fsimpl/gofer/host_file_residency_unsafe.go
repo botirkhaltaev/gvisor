@@ -42,7 +42,6 @@ func hostFilePagesResidentForRead(ctx context.Context, fd int, offset, length in
 	vec := make([]byte, (mapLength+hostarch.PageSize-1)/hostarch.PageSize)
 	_, _, errno := unix.Syscall(unix.SYS_MINCORE,
 		uintptr(unsafe.Pointer(&mapping[0])), uintptr(mapLength), uintptr(unsafe.Pointer(&vec[0])))
-	runtime.KeepAlive(mapping)
 	runtime.KeepAlive(vec)
 	if errno != 0 {
 		return false
