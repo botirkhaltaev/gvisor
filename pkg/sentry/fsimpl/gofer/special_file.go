@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/metric"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -209,6 +210,16 @@ func (fd *specialFileFD) Allocate(ctx context.Context, mode, offset, length uint
 	return fd.FileDescriptionDefaultImpl.Allocate(ctx, mode, offset, length)
 }
 
+const (
+	regularReadBufferThreshold = 64 << 20
+	regularReadBufferSize      = 1 << 20
+	regularReadChunkSize       = 1 << 20
+)
+
+var regularReadBufferPool = sync.Pool{
+	New: func() any { return new([regularReadBufferSize]byte) },
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	start := fsmetric.StartReadWait()
@@ -262,7 +273,41 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	}
 
 	rw := getHandleReadWriter(ctx, &fd.handle, offset)
-	n, err := dst.CopyOutFrom(ctx, rw)
+	var n int64
+	var err error
+	nonDirectRegularFile := fd.isRegularFile && fd.vfsfd.StatusFlags()&linux.O_DIRECT == 0
+	if nonDirectRegularFile && dst.NumBytes() > regularReadBufferThreshold &&
+		(fd.handle.fd < 0 || !hostFilePagesResidentForRead(int(fd.handle.fd), offset, dst.NumBytes())) {
+		// CopyOutFrom holds the process memory lock across the reader callback.
+		// A host filesystem read can block on remote storage, preventing other
+		// threads from faulting in unrelated memory until the read completes.
+		// Read into a bounded buffer before acquiring application mappings.
+		storage := regularReadBufferPool.Get().(*[regularReadBufferSize]byte)
+		defer regularReadBufferPool.Put(storage)
+		buf := storage[:min(dst.NumBytes(), int64(len(storage)))]
+		for dst.NumBytes() != 0 {
+			want := min(dst.NumBytes(), int64(len(buf)))
+			nr, readErr := rw.ReadToBlocks(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:want])))
+			nw, copyErr := dst.CopyOut(ctx, buf[:nr])
+			n += int64(nw)
+			dst = dst.DropFirst(nw)
+			if copyErr != nil {
+				err = copyErr
+				break
+			}
+			if uint64(nw) < nr {
+				break
+			}
+			if readErr != nil || nr < uint64(want) {
+				err = readErr
+				break
+			}
+		}
+	} else if nonDirectRegularFile {
+		n, err = dst.CopyOutFromIter(ctx, rw, regularReadChunkSize)
+	} else {
+		n, err = dst.CopyOutFrom(ctx, rw)
+	}
 	putHandleReadWriter(rw)
 	if linuxerr.Equals(linuxerr.EAGAIN, err) {
 		err = linuxerr.ErrWouldBlock

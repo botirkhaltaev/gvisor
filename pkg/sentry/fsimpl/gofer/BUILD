@@ -74,6 +74,7 @@ go_library(
         "fstree.go",
         "gofer.go",
         "handle.go",
+        "host_file_residency_unsafe.go",
         "host_named_pipe.go",
         "inode_impl.go",
         "inode_refs.go",
