@@ -31,7 +31,7 @@ func TestPacketMMapHostGRO(t *testing.T) {
 	frame := tPacketHdr(ring)
 	const mac = 64
 	payload := []byte{1, 2, 3, 4}
-	copy(frame[mac-virtioNetHdrSize:], (&virtioNetHdr{gsoType: _VIRTIO_NET_HDR_GSO_TCPV4, gsoSize: 1448}).marshal())
+	(&virtioNetHdr{gsoType: _VIRTIO_NET_HDR_GSO_TCPV4, gsoSize: 1448}).marshal((*[virtioNetHdrSize]byte)(frame[mac-virtioNetHdrSize : mac]))
 	copy(frame[mac:], payload)
 	binary.LittleEndian.PutUint16(frame[tpMacOffset:], mac)
 	binary.LittleEndian.PutUint32(frame[tpSnapLenOffset:], uint32(len(payload)))
