@@ -47,6 +47,10 @@ func (e *Endpoint) beforeSave() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if e.snd != nil {
+		e.snd.startCork = e.snd.corkTimer.enabled()
+	}
+
 	epState := e.EndpointState()
 	switch {
 	case epState == StateInitial || epState == StateBound:
@@ -275,10 +279,26 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 			e.timeWaitTimer = e.stack.Clock().AfterFunc(e.getTimeWaitDuration(), e.timeWaitTimerExpired)
 		}
 
-		if e.ops.GetCorkOption() {
-			// Rearm the timer if TCP_CORK is enabled which will
-			// drain all the segments in the queue after restore.
+		if e.snd.startCork {
+			// Release data held by TCP_CORK or MSG_MORE after restore.
 			e.snd.corkTimer.enable(MinRTO)
+		}
+		// Corked writes can wait for the peer even when the cork timer
+		// was never armed.
+		// TODO(gvisor.dev/issue/17893): Restore progress timers for uncorked connections.
+		snd := e.snd
+		if next := snd.writeNext; next != nil && (snd.SndWnd == 0 || snd.SndUna != snd.SndNxt) {
+			corked := e.ops.GetCorkOption() || snd.corkPushPending
+			for seg := next; seg != nil && !corked; seg = seg.Next() {
+				corked = seg.coalesceNext
+			}
+			if corked {
+				if snd.SndWnd == 0 {
+					snd.enableZeroWindowProbing()
+				} else if !snd.resendTimer.enabled() {
+					snd.resendTimer.enable(snd.RTO)
+				}
+			}
 		}
 		e.rcv.delayedACK = e.protocol.delayedACKEnabled()
 		if e.rcv.RcvNxt != e.snd.MaxSentAck {

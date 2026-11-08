@@ -1090,7 +1090,11 @@ func (e *Endpoint) sendRaw(pkt *stack.PacketBuffer, flags header.TCPFlags, seq, 
 
 // +checklocks:e.mu
 // +checklocksexclude:e.snd.rtt.rttMutex
-func (e *Endpoint) sendData(next *segment) {
+func (e *Endpoint) sendData(next *segment, mode sendMode) {
+	if mode != sendMore && e.snd.corkTimer.enabled() && !e.ops.GetCorkOption() {
+		e.snd.corkTimer.disable()
+	}
+
 	// Initialize the next segment to write if it's currently nil.
 	if e.snd.writeNext == nil {
 		if next == nil {
@@ -1099,8 +1103,11 @@ func (e *Endpoint) sendData(next *segment) {
 		e.snd.updateWriteNext(next)
 	}
 
-	// Push out any new packets.
-	e.snd.sendData()
+	// An option change flushes the current tail without adding another write.
+	if next == nil && !e.ops.GetCorkOption() {
+		e.snd.writeList.Back().coalesceNext = false
+	}
+	e.snd.sendData(mode)
 }
 
 // resetConnectionLocked puts the endpoint in an error state with the given

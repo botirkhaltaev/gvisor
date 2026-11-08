@@ -203,11 +203,13 @@ type sender struct {
 	// RFC3522 Section 3.2.
 	retransmitTS uint32
 
-	// startCork start corking the segments.
+	// startCork saves whether the cork timer was armed at checkpoint.
 	startCork bool
 
-	// corkTimer is used to drain the segments which are held when TCP_CORK
-	// option is enabled.
+	// corkPushPending records that cork expiry left data waiting for peer progress.
+	corkPushPending bool
+
+	// corkTimer releases segments held by TCP_CORK or MSG_MORE.
 	corkTimer timer `state:"nosave"`
 
 	// ackTimer sends a delayed ACK if no outgoing segment has carried it
@@ -453,7 +455,7 @@ func (s *sender) updateMaxPayloadSize(mtu, count int) {
 	// Since we likely reduced the number of outstanding packets, we may be
 	// ready to send some more.
 	s.updateWriteNext(nextSeg)
-	s.sendData()
+	s.sendData(sendNormal)
 }
 
 // sendAck sends an ACK segment.
@@ -711,7 +713,7 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 		return &tcpip.ErrTimeout{}
 	}
 
-	s.sendData()
+	s.sendData(sendNormal)
 
 	return nil
 }
@@ -751,7 +753,7 @@ func (s *sender) splitSeg(seg *segment, size int) {
 	// ref: net/ipv4/tcp_output.c::tcp_write_xmit(), tcp_mss_split_point()
 	// ref: net/ipv4/tcp_output.c::tcp_write_wakeup(), tcp_snd_wnd_test()
 	if seg.payloadSize() > s.MaxPayloadSize {
-		seg.flags ^= header.TCPFlagPsh
+		seg.flags &^= header.TCPFlagPsh
 	}
 	seg.pkt.Data().CapLength(size)
 }
@@ -871,42 +873,47 @@ func (s *sender) NextSeg(nextSegHint *segment) (nextSeg, hint *segment, rescueRt
 // lower of the specified limit value or the receivers window size specified by
 // end.
 // +checklocks:s.ep.mu
-func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (sent bool) {
+func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value, mode sendMode) (sent bool) {
 	// We abuse the flags field to determine if we have already
 	// assigned a sequence number to this segment.
 	newData := !s.isAssignedSequenceNumber(seg)
+	mergedPrefix := false
 	if newData {
 		// Merge segments if allowed.
-		if seg.payloadSize() != 0 {
-			available := int(s.SndNxt.Size(end))
-			if available > limit {
-				available = limit
-			}
+		if seg.payloadSize() != 0 && s.SndNxt.LessThan(end) {
+			available := min(int(s.SndNxt.Size(end)), limit)
 
-			// nextTooBig indicates that the next segment was too
-			// large to entirely fit in the current segment. It
-			// would be possible to split the next segment and merge
-			// the portion that fits, but unexpectedly splitting
-			// segments can have user visible side-effects which can
-			// break applications. For example, RFC 7766 section 8
+			// Preserve ordinary write boundaries when splitting would break
+			// applications. For example, RFC 7766 section 8
 			// says that the length and data of a DNS response
 			// should be sent in the same TCP segment to avoid
 			// triggering bugs in poorly written DNS
 			// implementations.
 			var nextTooBig bool
+			corkForWrite := mode == sendMore && seg.coalesceNext
 			for nSeg := seg.Next(); nSeg != nil && nSeg.payloadSize() != 0; nSeg = seg.Next() {
 				if seg.payloadSize()+nSeg.payloadSize() > available {
-					nextTooBig = true
+					if seg.coalesceNext && available >= s.MaxPayloadSize {
+						// MSG_MORE allows a full segment to include part of the next write.
+						full := available / s.MaxPayloadSize * s.MaxPayloadSize
+						if room := full - seg.payloadSize(); room > 0 {
+							seg.mergePrefix(nSeg, room)
+							mergedPrefix = true
+						}
+					} else {
+						nextTooBig = true
+					}
 					break
 				}
+				corkForWrite = corkForWrite && nSeg.coalesceNext
 				seg.merge(nSeg)
 				s.writeList.Remove(nSeg)
 				nSeg.DecRef()
 			}
 			if !nextTooBig {
-				nagle := s.Outstanding > 0 && s.ep.ops.GetDelayOption() &&
+				nagle := mode != sendPush && s.Outstanding > 0 && s.ep.ops.GetDelayOption() &&
 					s.SndUna.LessThan(s.smallSegmentEnd) && !s.SndNxt.LessThan(s.smallSegmentEnd)
-				cork := s.ep.ops.GetCorkOption()
+				cork := mode != sendPush && (corkForWrite || s.ep.ops.GetCorkOption())
 				if nagle || cork {
 					// GSO can send several segments at once. Send its full-MSS
 					// prefix while retaining the partial segment for coalescing.
@@ -917,7 +924,6 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 					case full != 0:
 						limit = min(limit, full)
 						if cork {
-							s.startCork = false
 							s.corkTimer.disable()
 						}
 					case seg.payloadSize() < available:
@@ -926,8 +932,7 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 						if nagle {
 							return false
 						}
-						if !s.startCork {
-							s.startCork = true
+						if !s.corkTimer.enabled() {
 							// Enable the timer for
 							// 200ms, after which
 							// the segments are drained.
@@ -1025,6 +1030,11 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 			}
 		}
 
+		if mergedPrefix {
+			// The next segment still holds part of this write.
+			seg.flags &^= header.TCPFlagPsh
+		}
+
 		segEnd = seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize()))
 	}
 
@@ -1097,6 +1107,13 @@ func (s *sender) disableZeroWindowProbing() {
 // +checklocks:s.ep.mu
 // +checklocksexclude:s.rtt.rttMutex
 func (s *sender) postXmit(dataSent bool, shouldScheduleProbe bool) {
+	if s.writeNext == nil {
+		s.corkPushPending = false
+		if s.corkTimer.enabled() {
+			s.corkTimer.disable()
+		}
+	}
+
 	if dataSent {
 		// We sent data, so we should stop the keepalive timer to ensure
 		// that no keepalives are sent while there is pending data.
@@ -1129,11 +1146,20 @@ func (s *sender) postXmit(dataSent bool, shouldScheduleProbe bool) {
 	}
 }
 
+// sendMode selects how a send pass applies Nagle and corking.
+type sendMode uint8
+
+const (
+	sendNormal sendMode = iota
+	sendMore
+	sendPush
+)
+
 // sendData sends new data segments. It is called when data becomes available or
 // when the send window opens up.
 // +checklocks:s.ep.mu
 // +checklocksexclude:s.rtt.rttMutex
-func (s *sender) sendData() {
+func (s *sender) sendData(mode sendMode) {
 	limit := s.MaxPayloadSize
 	if s.gso {
 		limit = int(s.ep.gso.MaxSize - header.TCPTotalHeaderMaximumSize - 1)
@@ -1164,7 +1190,7 @@ func (s *sender) sendData() {
 			s.updateWriteNext(seg.Next())
 			continue
 		}
-		if sent := s.maybeSendSegment(seg, limit, end); !sent {
+		if sent := s.maybeSendSegment(seg, limit, end, mode); !sent {
 			break
 		}
 		dataSent = true
@@ -1834,7 +1860,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 	// that the window opened up, or the congestion window was inflated due
 	// to a duplicate ack during fast recovery. This will also re-enable
 	// the retransmit timer if needed.
-	s.sendData()
+	s.sendData(sendNormal)
 }
 
 // sendSegment sends the specified segment.
@@ -1972,7 +1998,7 @@ func (s *sender) ackTimerExpired() tcpip.Error {
 	return nil
 }
 
-// corkTimerExpired drains all the segments when TCP_CORK is enabled.
+// corkTimerExpired releases data held by TCP_CORK or MSG_MORE.
 // +checklocks:s.ep.mu
 // +checklocksexclude:s.rtt.rttMutex
 func (s *sender) corkTimerExpired() tcpip.Error {
@@ -1982,14 +2008,17 @@ func (s *sender) corkTimerExpired() tcpip.Error {
 		return nil
 	}
 
-	// Assign sequence number and flags to the segment.
 	seg := s.writeNext
 	if seg == nil {
 		return nil
 	}
-	seg.sequenceNumber = s.SndNxt
-	seg.flags = header.TCPFlagAck | header.TCPFlagPsh
-	// Drain all the segments.
-	s.sendData()
+	s.writeList.Back().coalesceNext = false
+	// Retain the forced push if the window prevents transmission now.
+	if !s.isAssignedSequenceNumber(seg) {
+		seg.sequenceNumber = s.SndNxt
+		seg.flags = header.TCPFlagAck | header.TCPFlagPsh
+	}
+	s.sendData(sendNormal)
+	s.corkPushPending = s.writeNext != nil
 	return nil
 }

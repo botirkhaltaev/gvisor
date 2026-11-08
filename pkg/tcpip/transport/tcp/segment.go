@@ -82,6 +82,9 @@ type segment struct {
 	// acked indicates if the segment has already been SACKed.
 	acked bool
 
+	// coalesceNext allows the next write to fill a segment that ends here.
+	coalesceNext bool
+
 	// dataMemSize is the memory used by pkt initially. The value is used for
 	// memory accounting in the receive buffer instead of pkt.MemSize() because
 	// packet contents can be modified, so relying on the computed memory size
@@ -161,6 +164,7 @@ func (s *segment) clone() *segment {
 	t.rcvdTime = s.rcvdTime
 	t.xmitTime = s.xmitTime
 	t.xmitCount = s.xmitCount
+	t.coalesceNext = s.coalesceNext
 	t.ep = s.ep
 	t.qFlags = s.qFlags
 	t.dataMemSize = s.dataMemSize
@@ -178,6 +182,14 @@ func newSegment() *segment {
 // merge merges data in oth and clears oth.
 func (s *segment) merge(oth *segment) {
 	s.pkt.Data().Merge(oth.pkt.Data())
+	s.coalesceNext = oth.coalesceNext
+	s.dataMemSize = s.pkt.MemSize()
+	oth.dataMemSize = oth.pkt.MemSize()
+}
+
+// mergePrefix moves size payload bytes from the beginning of oth to the end of s.
+func (s *segment) mergePrefix(oth *segment, size int) {
+	s.pkt.Data().ReadFromPacketData(oth.pkt.Data(), size)
 	s.dataMemSize = s.pkt.MemSize()
 	oth.dataMemSize = oth.pkt.MemSize()
 }

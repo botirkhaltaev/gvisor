@@ -724,11 +724,9 @@ func (d PacketData) ReadFrom(src *buffer.Buffer, count int) int {
 // ReadFromPacketData moves count bytes from the beginning of oth to the end of
 // d.
 func (d PacketData) ReadFromPacketData(oth PacketData, count int) {
-	buf := oth.ToBuffer()
-	buf.Truncate(int64(count))
-	d.MergeBuffer(&buf)
+	prefix := oth.pk.buf.CloneRange(oth.pk.dataOffset(), count)
+	d.pk.buf.Merge(&prefix)
 	oth.TrimFront(count)
-	buf.Release()
 }
 
 // Merge clears headers in oth and merges its data with d.

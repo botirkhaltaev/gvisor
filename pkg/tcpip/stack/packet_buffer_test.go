@@ -904,6 +904,28 @@ func TestPacketDataReadToPreservesHeaders(t *testing.T) {
 	}
 }
 
+func TestReadFromPacketDataPreservesHeaders(t *testing.T) {
+	payload := buffer.MakeWithData([]byte("headabc"))
+	tail := buffer.MakeWithData([]byte("def"))
+	payload.Merge(&tail)
+	src := NewPacketBuffer(PacketBufferOptions{Payload: payload})
+	defer src.DecRef()
+	if _, ok := src.NetworkHeader().Consume(4); !ok {
+		t.Fatal("network header Consume failed")
+	}
+	dst := NewPacketBuffer(PacketBufferOptions{Payload: buffer.MakeWithData([]byte("prefix"))})
+	defer dst.DecRef()
+
+	dst.Data().ReadFromPacketData(src.Data(), 4)
+	checkPacketHeader(t, "network", src.NetworkHeader(), []byte("head"))
+	if got := string(dst.Data().AsRange().ToSlice()); got != "prefixabcd" {
+		t.Errorf("destination payload = %q, want prefixabcd", got)
+	}
+	if got := string(src.Data().AsRange().ToSlice()); got != "ef" {
+		t.Errorf("remaining source payload = %q, want ef", got)
+	}
+}
+
 func BenchmarkPacketDataReadTo(b *testing.B) {
 	for _, headerSize := range []int{0, 4} {
 		for _, fragments := range []int{1, 16} {

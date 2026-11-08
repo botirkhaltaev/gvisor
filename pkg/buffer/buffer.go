@@ -420,6 +420,27 @@ func (b *Buffer) Clone() Buffer {
 	return other
 }
 
+// CloneRange returns a copy-on-write clone of up to length bytes at offset.
+// Both arguments must be nonnegative.
+func (b *Buffer) CloneRange(offset, length int) Buffer {
+	var out Buffer
+	for v := b.data.Front(); length > 0 && v != nil; v = v.Next() {
+		if size := v.Size(); offset >= size {
+			offset -= size
+			continue
+		}
+		part := v.Clone()
+		if offset != 0 {
+			part.TrimFront(offset)
+			offset = 0
+		}
+		part.CapLength(length)
+		out.appendOwned(part)
+		length -= part.Size()
+	}
+	return out
+}
+
 // DeepClone creates a deep clone of b, copying data such that no bytes are
 // shared with any other Buffers.
 func (b *Buffer) DeepClone() Buffer {

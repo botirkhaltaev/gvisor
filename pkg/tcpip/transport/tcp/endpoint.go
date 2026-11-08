@@ -1619,12 +1619,12 @@ func (e *Endpoint) isEndpointWritableLocked() (int, tcpip.Error) {
 	return avail, nil
 }
 
-// readFromPayloader reads a slice from the Payloader.
+// readFromPayloader reads up to count bytes from the Payloader.
 // +checklocks:e.mu
 // +checklocks:e.sndQueueInfo.sndQueueMu
 // +checklocksexclude:e.segmentQueue.mu
 // +checklocksexclude:e.pendingProcessingMu
-func (e *Endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions, avail int) (buffer.Buffer, tcpip.Error) {
+func (e *Endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions, count int) (buffer.Buffer, tcpip.Error) {
 	// We can release locks while copying data.
 	//
 	// This is not possible if atomic is set, because we can't allow the
@@ -1646,13 +1646,10 @@ func (e *Endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions,
 
 	// Fetch data.
 	var payload buffer.Buffer
-	if l := p.Len(); l < avail {
-		avail = l
-	}
-	if avail == 0 {
+	if count == 0 {
 		return payload, nil
 	}
-	if _, err := payload.WriteFromReaderAndLimitedReader(p, int64(avail), limRdr); err != nil {
+	if _, err := payload.WriteFromReaderAndLimitedReader(p, int64(count), limRdr); err != nil {
 		payload.Release()
 		return buffer.Buffer{}, &tcpip.ErrBadBuffer{}
 	}
@@ -1663,7 +1660,7 @@ func (e *Endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions,
 // +checklocks:e.mu
 // +checklocksexclude:e.segmentQueue.mu
 // +checklocksexclude:e.pendingProcessingMu
-func (e *Endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*segment, int, tcpip.Error) {
+func (e *Endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions, wanted int) (*segment, int, tcpip.Error) {
 	e.sndQueueInfo.sndQueueMu.Lock()
 	defer e.sndQueueInfo.sndQueueMu.Unlock()
 
@@ -1673,7 +1670,7 @@ func (e *Endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*se
 		return nil, 0, err
 	}
 
-	buf, err := e.readFromPayloader(p, opts, avail)
+	buf, err := e.readFromPayloader(p, opts, min(avail, wanted))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1716,20 +1713,31 @@ func (e *Endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*se
 // +checklocksexclude:e.pendingProcessingMu
 func (e *Endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcpip.Error) {
 	// Linux completely ignores any address passed to sendto(2) for TCP sockets
-	// (without the MSG_FASTOPEN flag). Corking is unimplemented, so opts.More
-	// and opts.EndOfRecord are also ignored.
+	// (without the MSG_FASTOPEN flag). opts.EndOfRecord is also ignored.
 
 	e.LockUser()
 	defer e.UnlockUser()
 
 	// Return if either we didn't queue anything or if an error occurred while
 	// attempting to queue data.
-	nextSeg, n, err := e.queueSegment(p, opts)
+	wanted := p.Len()
+	nextSeg, n, err := e.queueSegment(p, opts, wanted)
 	if n == 0 || err != nil {
 		return 0, err
 	}
 
-	e.sendData(nextSeg)
+	mode := sendNormal
+	if n < wanted {
+		// Push the accepted bytes without extending a MSG_MORE batch.
+		// TODO(gvisor.dev/issue/17894): Check ordinary short-write flushing.
+		if prev := nextSeg.Prev(); opts.More || (prev != nil && prev.xmitCount == 0 && prev.coalesceNext) {
+			mode = sendPush
+		}
+	} else if opts.More {
+		nextSeg.coalesceNext = true
+		mode = sendMore
+	}
+	e.sendData(nextSeg, mode)
 	return int64(n), nil
 }
 
@@ -1846,7 +1854,7 @@ func (e *Endpoint) OnDelayOptionSet(v bool) {
 		defer e.UnlockUser()
 		// Handle delayed data.
 		if e.EndpointState().connected() {
-			e.sendData(nil /* next */)
+			e.sendData(nil /* next */, sendNormal)
 		}
 	}
 }
@@ -1864,7 +1872,7 @@ func (e *Endpoint) OnCorkOptionSet(v bool) {
 		}
 		// Handle the corked data.
 		if e.EndpointState().connected() {
-			e.sendData(nil /* next */)
+			e.sendData(nil /* next */, sendNormal)
 		}
 	}
 }
@@ -2749,7 +2757,7 @@ func (e *Endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 			e.sndQueueInfo.sndQueueMu.Unlock()
 
 			// Drain the send queue.
-			e.sendData(s)
+			e.sendData(s, sendNormal)
 
 			// Mark send side as closed.
 			e.snd.Closed = true
