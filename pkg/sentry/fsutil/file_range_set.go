@@ -99,6 +99,8 @@ func (s *FileRangeSet) PagesToFill(required, optional memmap.MappableRange) uint
 // the same page are zeroed; pages after EOF are invalid. fileSize is an upper
 // bound on the file's size; bytes after fileSize will be zeroed without
 // calling readAt.
+// readAt must initialize every byte in its reported prefix without reading the
+// destination as input, exposing it to others, or retaining it after return.
 //
 // Fill may read offsets outside of required, but will never read offsets
 // outside of optional. It returns a non-nil error if any error occurs, even
@@ -123,43 +125,39 @@ func (s *FileRangeSet) Fill(ctx context.Context, required, optional memmap.Mappa
 		// Read data into the gap.
 		if readAt != nil {
 			opts.ReaderFunc = func(dsts safemem.BlockSeq) (uint64, error) {
-				var done uint64
-				for !dsts.IsEmpty() {
-					n, err := func() (uint64, error) {
-						off := gr.Start + done
-						if off >= fileSize {
-							return 0, io.EOF
-						}
-						if off+dsts.NumBytes() > fileSize {
-							rd := fileSize - off
-							n, err := readAt(ctx, dsts.TakeFirst64(rd), off)
-							if n == rd && err == nil {
-								return n, io.EOF
-							}
-							return n, err
-						}
-						return readAt(ctx, dsts, off)
-					}()
-					done += n
-					dsts = dsts.DropFirst64(n)
-					if err != nil {
-						if err == io.EOF {
-							// MemoryFile.AllocateAndFill truncates down to a page
-							// boundary, but FileRangeSet.Fill is supposed to
-							// zero-fill to the end of the page in this case.
-							donepgaddr, ok := hostarch.Addr(done).RoundUp()
-							if donepg := uint64(donepgaddr); ok && donepg != done {
-								dsts.DropFirst64(donepg - done)
-								done = donepg
-								if dsts.IsEmpty() {
-									return done, nil
-								}
-							}
-						}
-						return done, err
-					}
+				if gr.Start >= fileSize {
+					return 0, io.EOF
 				}
-				return done, nil
+				readSize := min(dsts.NumBytes(), fileSize-gr.Start)
+				done, err := safemem.ReadFullToBlocks(func(remaining safemem.BlockSeq) (uint64, error) {
+					return readAt(ctx, remaining, gr.Start+(readSize-remaining.NumBytes()))
+				}, dsts.TakeFirst64(readSize))
+				if err == nil && done == dsts.NumBytes() {
+					return done, nil
+				}
+				if err != nil && err != io.EOF {
+					return done, err
+				}
+
+				// Allocate keeps only complete pages. Initialize the rest of
+				// the final page so Fill can keep that page at EOF.
+				padded, ok := hostarch.Addr(done).RoundUp()
+				if !ok || uint64(padded) == done {
+					return done, io.EOF
+				}
+				padding := uint64(padded) - done
+				n, err := safemem.ZeroSeq(dsts.DropFirst64(done).TakeFirst64(padding))
+				done += n
+				if err != nil {
+					return done, err
+				}
+				if n != padding {
+					return done, io.ErrShortWrite
+				}
+				if done == dsts.NumBytes() {
+					return done, nil
+				}
+				return done, io.EOF
 			}
 		}
 

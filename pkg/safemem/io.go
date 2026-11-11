@@ -16,6 +16,7 @@ package safemem
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"math"
 )
@@ -46,16 +47,23 @@ type Writer interface {
 	WriteFromBlocks(srcs BlockSeq) (uint64, error)
 }
 
-// ReadFullToBlocks repeatedly invokes r until dsts.NumBytes() bytes have been
-// read or r returns an error. Note that we avoid a Reader interface receiver
-// to avoid heap allocation.
+// ReadFullToBlocks reads from r until dsts is full or r returns an error.
+// It returns io.ErrNoProgress for a zero-byte read without an error and
+// rejects counts that exceed the remaining destination.
+// ReaderFunc avoids a Reader interface receiver and its heap allocation.
 func ReadFullToBlocks(r ReaderFunc, dsts BlockSeq) (uint64, error) {
 	var done uint64
 	for !dsts.IsEmpty() {
 		n, err := r(dsts)
+		if n > dsts.NumBytes() {
+			return done, fmt.Errorf("reader returned %d bytes for %d-byte destination", n, dsts.NumBytes())
+		}
 		done += n
 		if err != nil {
 			return done, err
+		}
+		if n == 0 {
+			return done, io.ErrNoProgress
 		}
 		dsts = dsts.DropFirst64(n)
 	}
