@@ -971,6 +971,10 @@ func TestMemoryFileRefAccountingMatchesPerPageModel(t *testing.T) {
 		}
 	}
 	verify("after fragmented references")
+	dec(0, numPages)
+	verify("after whole-range decrement to mixed references")
+	inc(0, numPages)
+	verify("after whole-range increment through gaps")
 	inc(0, numPages)
 	verify("after whole-range increment")
 	dec(0, numPages)
