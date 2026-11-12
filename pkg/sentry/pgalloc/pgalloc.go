@@ -1287,23 +1287,28 @@ func (f *MemoryFile) incRefLocked(fr memmap.FileRange) {
 //
 // +checklocks:f.mu
 func (f *MemoryFile) incExtraRefsLocked(fr memmap.FileRange) {
+	seg, gap := f.extraRefs.Find(fr.Start)
 	for pos := fr.Start; pos < fr.End; {
-		seg, gap := f.extraRefs.Find(pos)
+		var end uint64
 		if seg.Ok() {
-			end := min(seg.End(), fr.End)
+			end = min(seg.End(), fr.End)
 			seg = f.extraRefs.Isolate(seg, memmap.FileRange{Start: pos, End: end})
 			if seg.ValuePtr().extra >= math.MaxUint64-1 {
 				panic(fmt.Sprintf("extra reference count overflow on pages %v", seg.Range()))
 			}
 			seg.ValuePtr().extra++
-			f.extraRefs.Unisolate(seg)
-			pos = end
-			continue
+		} else {
+			end = min(gap.End(), fr.End)
+			seg = f.extraRefs.InsertWithoutMerging(gap, memmap.FileRange{Start: pos, End: end}, extraRefInfo{extra: 1})
 		}
-
-		end := min(gap.End(), fr.End)
-		f.extraRefs.Insert(gap, memmap.FileRange{Start: pos, End: end}, extraRefInfo{extra: 1})
+		if pos == fr.Start {
+			seg = f.extraRefs.MergePrev(seg)
+		}
+		if end == fr.End {
+			seg = f.extraRefs.MergeNext(seg)
+		}
 		pos = end
+		seg, gap = seg.NextNonEmpty()
 	}
 }
 
@@ -1357,25 +1362,33 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 // +checklocks:f.mu
 func (f *MemoryFile) decRefRangeLocked(fr memmap.FileRange, unfree *unfreeSet, unwaste *unwasteSet) bool {
 	haveWaste := false
+	seg := f.extraRefs.LowerBoundSegment(fr.Start)
 	for pos := fr.Start; pos < fr.End; {
-		seg, gap := f.extraRefs.Find(pos)
-		if seg.Ok() {
-			end := min(seg.End(), fr.End)
-			seg = f.extraRefs.Isolate(seg, memmap.FileRange{Start: pos, End: end})
-			if seg.Value().extra == 1 {
-				f.extraRefs.Remove(seg)
-			} else {
-				seg.ValuePtr().extra--
-				f.extraRefs.Unisolate(seg)
+		if !seg.Ok() || pos < seg.Start() {
+			end := fr.End
+			if seg.Ok() {
+				end = min(seg.Start(), fr.End)
 			}
+			f.markWasteLocked(memmap.FileRange{Start: pos, End: end}, unfree, unwaste)
+			haveWaste = true
 			pos = end
 			continue
 		}
 
-		end := min(gap.End(), fr.End)
-		part := memmap.FileRange{Start: pos, End: end}
-		f.markWasteLocked(part, unfree, unwaste)
-		haveWaste = true
+		end := min(seg.End(), fr.End)
+		seg = f.extraRefs.Isolate(seg, memmap.FileRange{Start: pos, End: end})
+		if seg.Value().extra == 1 {
+			seg = f.extraRefs.Remove(seg).NextSegment()
+		} else {
+			seg.ValuePtr().extra--
+			if pos == fr.Start {
+				seg = f.extraRefs.MergePrev(seg)
+			}
+			if end == fr.End {
+				seg = f.extraRefs.MergeNext(seg)
+			}
+			seg = seg.NextSegment()
+		}
 		pos = end
 	}
 	return haveWaste

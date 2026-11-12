@@ -736,16 +736,19 @@ func TestZeroDiskBackedPanicsOnNonzeroUnwritablePage(t *testing.T) {
 }
 
 func BenchmarkMemoryFileRefAccounting(b *testing.B) {
-	const pages = 1024
 	pageSize := uint64(hostarch.PageSize)
 	for _, bc := range []struct {
 		name        string
+		pages       int
 		stride      uint64
 		singleRange bool
+		fragmented  bool
 	}{
-		{name: "contiguous-range", singleRange: true},
-		{name: "adjacent-single-pages", stride: 1},
-		{name: "sparse-single-pages", stride: 4},
+		{name: "contiguous-range", pages: 1024, singleRange: true},
+		{name: "adjacent-single-pages", pages: 1024, stride: 1},
+		{name: "sparse-single-pages", pages: 1024, stride: 4},
+		{name: "whole-fragmented-range-1024", pages: 1024, singleRange: true, fragmented: true},
+		{name: "whole-fragmented-range-65536", pages: 65536, singleRange: true, fragmented: true},
 	} {
 		b.Run(bc.name, func(b *testing.B) {
 			file := openSaveTestFile(b, "")
@@ -757,12 +760,22 @@ func BenchmarkMemoryFileRefAccounting(b *testing.B) {
 				file.Close()
 				b.Fatalf("NewMemoryFile: %v", err)
 			}
-			backing, err := f.Allocate(4*pages*pageSize, AllocOpts{Mode: AllocateUncommitted})
+			backing, err := f.Allocate(4*uint64(bc.pages)*pageSize, AllocOpts{Mode: AllocateUncommitted})
 			if err != nil {
 				f.Destroy()
 				b.Fatalf("Allocate: %v", err)
 			}
 			b.Cleanup(func() {
+				if bc.fragmented {
+					for i := 0; i < bc.pages; i++ {
+						start := backing.Start + uint64(i)*pageSize
+						fr := memmap.FileRange{Start: start, End: start + pageSize}
+						f.DecRef(fr)
+						if i%2 == 0 {
+							f.DecRef(fr)
+						}
+					}
+				}
 				f.DecRef(backing)
 				f.Destroy()
 			})
@@ -770,31 +783,65 @@ func BenchmarkMemoryFileRefAccounting(b *testing.B) {
 			var ranges []memmap.FileRange
 			if bc.singleRange {
 				ranges = make([]memmap.FileRange, 1)
-				ranges[0] = memmap.FileRange{Start: backing.Start, End: backing.Start + pages*pageSize}
+				ranges[0] = memmap.FileRange{Start: backing.Start, End: backing.Start + uint64(bc.pages)*pageSize}
 			} else {
-				ranges = make([]memmap.FileRange, pages)
+				ranges = make([]memmap.FileRange, bc.pages)
 				for i := range ranges {
 					start := backing.Start + uint64(i)*bc.stride*pageSize
 					ranges[i] = memmap.FileRange{Start: start, End: start + pageSize}
 				}
 			}
 
-			if !f.HasUniqueRef(backing) {
-				b.Fatal("backing allocation is not initially unique")
-			}
-			for _, fr := range ranges {
-				f.IncRef(fr, 0)
-			}
-			for _, fr := range ranges {
-				if f.HasUniqueRef(fr) {
-					b.Fatalf("range %v is unique after IncRef", fr)
+			checkFragmentedCounts := func(stage string) {
+				if !bc.fragmented {
+					return
+				}
+				f.mu.Lock()
+				metadata := f.exportMetadataProto()
+				f.mu.Unlock()
+				pageIndex := 0
+				for _, r := range metadata.UnfreeSmall {
+					for start := max(r.Start, backing.Start); start < min(r.End, ranges[0].End); start += pageSize {
+						want := uint64(3 - pageIndex%2)
+						if r.Refs != want {
+							b.Fatalf("%s: page %d has %d references, want %d", stage, pageIndex, r.Refs, want)
+						}
+						pageIndex++
+					}
+				}
+				if pageIndex != bc.pages {
+					b.Fatalf("%s: found %d pages, want %d", stage, pageIndex, bc.pages)
 				}
 			}
-			for _, fr := range ranges {
-				f.DecRef(fr)
-			}
-			if !f.HasUniqueRef(backing) {
-				b.Fatal("backing allocation is not unique after DecRef")
+
+			if bc.fragmented {
+				for i := 0; i < bc.pages; i++ {
+					start := backing.Start + uint64(i)*pageSize
+					fr := memmap.FileRange{Start: start, End: start + pageSize}
+					f.IncRef(fr, 0)
+					if i%2 == 0 {
+						f.IncRef(fr, 0)
+					}
+				}
+				checkFragmentedCounts("after setup")
+			} else {
+				if !f.HasUniqueRef(backing) {
+					b.Fatal("backing allocation is not initially unique")
+				}
+				for _, fr := range ranges {
+					f.IncRef(fr, 0)
+				}
+				for _, fr := range ranges {
+					if f.HasUniqueRef(fr) {
+						b.Fatalf("range %v is unique after IncRef", fr)
+					}
+				}
+				for _, fr := range ranges {
+					f.DecRef(fr)
+				}
+				if !f.HasUniqueRef(backing) {
+					b.Fatal("backing allocation is not unique after DecRef")
+				}
 			}
 
 			b.ReportAllocs()
@@ -806,7 +853,9 @@ func BenchmarkMemoryFileRefAccounting(b *testing.B) {
 					f.DecRef(fr)
 				}
 			}
-			if !f.HasUniqueRef(backing) {
+			if bc.fragmented {
+				checkFragmentedCounts("after benchmark loop")
+			} else if !f.HasUniqueRef(backing) {
 				b.Fatal("backing allocation is not unique after benchmark loop")
 			}
 		})
@@ -815,7 +864,7 @@ func BenchmarkMemoryFileRefAccounting(b *testing.B) {
 
 func TestMemoryFileRefAccountingMatchesPerPageModel(t *testing.T) {
 	f := newSaveTestMemoryFile(t, "", false)
-	const numPages = 10
+	const numPages = 64
 	backing, err := f.Allocate(numPages*uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
@@ -915,6 +964,24 @@ func TestMemoryFileRefAccountingMatchesPerPageModel(t *testing.T) {
 	verify("after third overlapping reference")
 	dec(3, 6)
 	verify("after partial release")
+	for i := 0; i < numPages; i++ {
+		inc(i, i+1)
+		if i%2 == 0 {
+			inc(i, i+1)
+		}
+	}
+	verify("after fragmented references")
+	inc(0, numPages)
+	verify("after whole-range increment")
+	dec(0, numPages)
+	verify("after whole-range decrement")
+	for i := 0; i < numPages; i++ {
+		dec(i, i+1)
+		if i%2 == 0 {
+			dec(i, i+1)
+		}
+	}
+	verify("after removing fragmented references")
 	dec(3, 4)
 	verify("after making a gap in shared pages")
 	dec(4, 5)
