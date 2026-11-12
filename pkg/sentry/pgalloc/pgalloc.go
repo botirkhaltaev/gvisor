@@ -1299,13 +1299,18 @@ func (f *MemoryFile) incExtraRefsLocked(fr memmap.FileRange) {
 			seg.ValuePtr().extra++
 		} else {
 			end = min(gap.End(), fr.End)
+			if end == fr.End {
+				f.extraRefs.Insert(gap, memmap.FileRange{Start: pos, End: end}, extraRefInfo{extra: 1})
+				return
+			}
 			seg = f.extraRefs.InsertWithoutMerging(gap, memmap.FileRange{Start: pos, End: end}, extraRefInfo{extra: 1})
 		}
 		if pos == fr.Start {
 			seg = f.extraRefs.MergePrev(seg)
 		}
 		if end == fr.End {
-			seg = f.extraRefs.MergeNext(seg)
+			f.extraRefs.MergeNext(seg)
+			return
 		}
 		pos = end
 		seg, gap = seg.NextNonEmpty()
@@ -1378,14 +1383,19 @@ func (f *MemoryFile) decRefRangeLocked(fr memmap.FileRange, unfree *unfreeSet, u
 		end := min(seg.End(), fr.End)
 		seg = f.extraRefs.Isolate(seg, memmap.FileRange{Start: pos, End: end})
 		if seg.Value().extra == 1 {
-			seg = f.extraRefs.Remove(seg).NextSegment()
+			gap := f.extraRefs.Remove(seg)
+			if end == fr.End {
+				return haveWaste
+			}
+			seg = gap.NextSegment()
 		} else {
 			seg.ValuePtr().extra--
 			if pos == fr.Start {
 				seg = f.extraRefs.MergePrev(seg)
 			}
 			if end == fr.End {
-				seg = f.extraRefs.MergeNext(seg)
+				f.extraRefs.MergeNext(seg)
+				return haveWaste
 			}
 			seg = seg.NextSegment()
 		}
