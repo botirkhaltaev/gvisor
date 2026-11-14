@@ -405,12 +405,12 @@ func TestFindAllocatable64K(t *testing.T) {
 					}
 					switch es.state {
 					case existingUsed:
-						unfree.InsertRange(chunkFR, unfreeInfo{refs: 1})
+						unfree.InsertRange(chunkFR, unfreeInfo{used: true})
 					case existingWaste:
-						unfree.InsertRange(chunkFR, unfreeInfo{refs: 0})
+						unfree.InsertRange(chunkFR, unfreeInfo{})
 						unwaste.RemoveRange(chunkFR)
 					case existingReleasing:
-						unfree.InsertRange(chunkFR, unfreeInfo{refs: 0})
+						unfree.InsertRange(chunkFR, unfreeInfo{})
 					default:
 						t.Fatalf("existingSegment %+v has unknown state", es)
 					}
