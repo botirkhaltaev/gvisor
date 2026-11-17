@@ -136,6 +136,7 @@ go_test(
     name = "proc_test",
     size = "small",
     srcs = [
+        "nvproxy_test.go",
         "tasks_sys_lazy_test.go",
         "tasks_sys_test.go",
         "tasks_test.go",

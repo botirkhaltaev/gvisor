@@ -1872,7 +1872,7 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 		if devClient == nil {
 			return fmt.Errorf("dev gofer client not found in context")
 		}
-		minors, err := nvidiaRegularDeviceMinorsFromGofer(ctx, devClient)
+		minors, err := nvproxy.RegularDeviceMinorsFromGofer(ctx, devClient)
 		if err != nil {
 			return err
 		}
