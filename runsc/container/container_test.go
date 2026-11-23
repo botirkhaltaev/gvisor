@@ -6795,6 +6795,20 @@ func TestSaveRestoreExecReconfigure(t *testing.T) {
 		t.Fatalf("checkpoint after restore failed: %v", err)
 	}
 	wantHookLog("save\nresume\nsave\nresume\nrestore\nsave\nresume\n")
+
+	// A failed save hook must not run its resume hook or kill the application.
+	failedHookPath := filepath.Join(dir, "failed-hook.sh")
+	if err := os.WriteFile(failedHookPath, []byte(hook+"exit 1\n"), 0777); err != nil {
+		t.Fatalf("writing failing save hook: %v", err)
+	}
+	checkpointOpts.SaveRestoreExecArgv = failedHookPath
+	if err := cont2.Checkpoint(conf, imageDir("image-failed-hook"), checkpointOpts); err == nil {
+		t.Fatal("checkpoint with a failing save hook succeeded")
+	}
+	wantHookLog("save\nresume\nsave\nresume\nrestore\nsave\nresume\nsave\n")
+	if ws, err := execute(conf, cont2, "/bin/true"); err != nil || ws.ExitStatus() != 0 {
+		t.Fatalf("application after failed save hook: status %v, error %v", ws, err)
+	}
 }
 
 func TestMarkerFile(t *testing.T) {

@@ -334,7 +334,7 @@ func TestStartupHeapReleaseOnRestore(t *testing.T) {
 	// Put the loader in the state that a restore leaves it in after the
 	// restored kernel starts (see containerManager.Restore and Loader.run).
 	l.mu.Lock()
-	l.state = restoringStarted
+	l.setStateLocked(restoringReady)
 	l.mu.Unlock()
 	l.ctrl.manager.onRestoreDone(sentryapi.Savings{})
 	// A second trigger while the release is pending doesn't add a release.

@@ -209,70 +209,96 @@ func setSaveOptsForCheckpointGofer(o *controlapi.SaveOpts, saveOpts *state.SaveO
 	return nil
 }
 
-// Save saves the running system with the given options. If saveOpts.Resume is
-// true, the caller must call PostResume afterwards.
-func Save(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) error {
-	if err := preSave(k, saveOpts, execOpts); err != nil {
-		return err
+// SaveStage identifies the last checkpoint preparation stage with work to undo.
+// Stages record partial accelerator preparation as well as completed work.
+// They are ordered by preparation; unused stages have no state to undo.
+type SaveStage uint32
+
+const (
+	// SaveUnprepared indicates that no preparation needs to be undone.
+	SaveUnprepared SaveStage = iota
+	// SaveTPUPrepared indicates that at least one TPU task was prepared.
+	SaveTPUPrepared
+	// SaveExecPrepared indicates that the application's save hook completed.
+	SaveExecPrepared
+	// SaveCUDAPrepared indicates that at least one CUDA process was prepared.
+	SaveCUDAPrepared
+)
+
+// Save saves the running system with the given options. The returned
+// preparation must be resumed even on error. On a successful non-resuming save,
+// the kernel has exited and no undo work is returned.
+func Save(k *kernel.Kernel, w *watchdog.Watchdog, saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts, runHook func(SaveRestoreExecMode) error) (SaveStage, error) {
+	prepared, err := preSave(k, saveOpts, execOpts, runHook)
+	if err != nil {
+		return prepared, err
 	}
-	return saveOpts.Save(k.SupervisorContext(), k, w)
+	err = saveOpts.Save(k.SupervisorContext(), k, w)
+	if err == nil && !saveOpts.Resume {
+		return SaveUnprepared, nil
+	}
+	return prepared, err
 }
 
-// preSave is called before saving the kernel.
-func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) error {
-	if err := preSaveTPU(k); err != nil {
-		return err
-	}
-
+func preSave(k *kernel.Kernel, o *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts, runHook func(SaveRestoreExecMode) error) (prepared SaveStage, err error) {
+	var argv []string
 	if execOpts.Argv != "" {
-		argv := strings.Split(execOpts.Argv, " ")
-		if err := ConfigureSaveRestoreExec(k, argv, execOpts.Timeout, execOpts.ContainerID); err != nil {
-			return fmt.Errorf("failed to configure save/restore binary: %w", err)
-		}
-		if err := SaveRestoreExec(k, SaveRestoreExecSave); err != nil {
-			return fmt.Errorf("failed to exec save/restore binary: %w", err)
-		}
+		argv = strings.Split(execOpts.Argv, " ")
 	}
-	return preSaveCuda(k, o)
+	if err := ConfigureSaveRestoreExec(k, argv, execOpts.Timeout, execOpts.ContainerID); err != nil {
+		return prepared, fmt.Errorf("failed to configure save/restore binary: %w", err)
+	}
+	prepared, err = preSaveTPU(k)
+	if err != nil {
+		return prepared, err
+	}
+
+	if len(argv) != 0 {
+		if err := runHook(SaveRestoreExecSave); err != nil {
+			return prepared, fmt.Errorf("failed to exec save/restore binary: %w", err)
+		}
+		prepared = SaveExecPrepared
+	}
+	cudaStage, err := preSaveCuda(k, o)
+	return max(prepared, cudaStage), err
 }
 
-// PostResume is called after resuming the kernel.
-//
-// Precondition: The kernel should be running.
-func PostResume(k *kernel.Kernel, timeline *timing.Timeline) error {
-	if k.IsPaused() {
-		// The kernel is still paused (double-pause can happen with Docker which
-		// calls pause first and then checkpoint command). The final resume command
-		// will invoke save/restore binary if necessary.
-		return nil
-	}
+// PostResume undoes recorded checkpoint preparation and kills the sandbox if
+// cleanup fails. It must run once per checkpoint and serialize with control API
+// pause transitions.
+func PostResume(k *kernel.Kernel, prepared SaveStage, runHook func(SaveRestoreExecMode) error) (err error) {
 	if k.TaskSet().IsExiting() {
 		// This can occur when kernel is saved with control.SaveOpts.Resume=false.
 		// We can not invoke the save/restore binary on such a kernel.
 		return nil
 	}
-	// Undo preSave in reverse order.
-	if err := postResumeCuda(k, timeline); err != nil {
-		return err
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("failed to undo checkpoint preparation: %w", err)
+			log.Warningf("Killing the sandbox: %v", err)
+			k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		}
+	}()
+	if prepared >= SaveCUDAPrepared {
+		if err := postResumeCuda(k, nil); err != nil {
+			// Application code cannot safely run after CUDA resume fails.
+			return err
+		}
 	}
-
-	if err := SaveRestoreExec(k, SaveRestoreExecResume); err != nil {
-		return fmt.Errorf("failed to wait for save/restore binary: %w", err)
+	if prepared >= SaveExecPrepared {
+		if hookErr := runHook(SaveRestoreExecResume); hookErr != nil {
+			err = fmt.Errorf("failed to wait for save/restore binary: %w", hookErr)
+		}
 	}
-
-	return postResumeTPU(k)
+	if prepared >= SaveTPUPrepared {
+		err = errors.Join(err, postResumeTPU(k))
+	}
+	return err
 }
 
-// PostRestore is called after restoring the kernel.
-//
-// Precondition: The kernel should be running.
-func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
-	if k.IsPaused() {
-		// The kernel is still paused (double-pause can happen with Docker which
-		// calls pause first and then checkpoint command). The final resume command
-		// will invoke cuda-checkpoint if necessary.
-		return nil
-	}
+// PostRestore finishes restoring the kernel. Tasks must be unpaused so that
+// CUDA and application helpers can run.
+func PostRestore(k *kernel.Kernel, timeline *timing.Timeline, runHook func() error) error {
 	if k.TaskSet().IsExiting() {
 		// This can occur when kernel is saved with control.SaveOpts.Resume=false.
 		// We can not invoke cuda-checkpoint on such a kernel.
@@ -283,7 +309,7 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 		return err
 	}
 
-	if err := SaveRestoreExec(k, SaveRestoreExecRestore); err != nil {
+	if err := runHook(); err != nil {
 		return fmt.Errorf("failed to wait for save/restore binary: %w", err)
 	}
 
@@ -293,8 +319,8 @@ func PostRestore(k *kernel.Kernel, timeline *timing.Timeline) error {
 // SaveRestoreExec creates a new process that executes the save/restore
 // binary specified by k.SaveRestoreExecConfig and waits for it to finish.
 //
-// Precondition: The kernel should be running; k.SetSaveRestoreExecConfig should
-// be setup with an argv, otherwise this function is a no-op.
+// The hook needs guest tasks to run before its timeout. If no hook is
+// configured, this function returns without starting a process.
 func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 	if k.SaveRestoreExecConfig == nil {
 		return nil
@@ -364,7 +390,7 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 	waitC := make(chan struct{})
 	go func() {
 		tg.WaitExited()
-		waitC <- struct{}{}
+		close(waitC)
 	}()
 	select {
 	case <-waitC:
@@ -380,14 +406,17 @@ func SaveRestoreExec(k *kernel.Kernel, mode SaveRestoreExecMode) error {
 }
 
 // ConfigureSaveRestoreExec sets the configuration for the save/restore binary.
+// An empty argv disables the binary for this checkpoint.
 // If containerID is empty, the global init process will be used for the
 // save/restore binary's leader task.
 //
-// A previously stored configuration is replaced: a sandbox may be
-// checkpointed repeatedly, and the configuration also survives in the kernel
-// state across a restore. The leader task is always resolved anew, since a
-// task stored by an earlier call may have exited.
+// The leader task is resolved anew, since a task stored by an earlier
+// checkpoint may have exited.
 func ConfigureSaveRestoreExec(k *kernel.Kernel, argv []string, timeout time.Duration, containerID string) error {
+	if len(argv) == 0 {
+		k.SaveRestoreExecConfig = nil
+		return nil
+	}
 	leader, err := findContainerInitProcess(k, containerID)
 	if err != nil {
 		return err

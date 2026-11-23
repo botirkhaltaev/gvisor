@@ -61,7 +61,16 @@ const (
 // +checklocksexclude:l.mu
 // +checklocksexclude:l.k.fsSaveMu
 func (l *Loader) FSSave() error {
+	if !l.fsSaveMu.TryRLock() {
+		return linuxerr.EBUSY
+	}
+	defer l.fsSaveMu.RUnlock()
+	// A guest woken by restore completion must also see the ready state.
 	l.mu.Lock()
+	if l.currentState().blocksFSSave() {
+		l.mu.Unlock()
+		return linuxerr.EBUSY
+	}
 	fsSaveFDs := l.fsSaveFDs
 	l.fsSaveFDs = nil
 	useCheckpointGofer := l.fsSaveCheckpointGofer

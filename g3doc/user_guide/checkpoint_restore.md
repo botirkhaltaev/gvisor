@@ -320,6 +320,11 @@ Annotation                                                    | Description     
 `dev.gvisor.internal.checkpoint.save-restore-exec-argv`       | Argv of a binary to exec around save/restore.                                                         | (unset)
 `dev.gvisor.internal.checkpoint.save-restore-exec-timeout`    | Timeout for the save/restore exec binary (e.g. `30s`).                                                | 10 minutes
 
+The save/restore hook applies to the checkpoint that specifies it. An image
+created without a hook has no restore hook, even if an earlier checkpoint used
+one. If the sandbox is paused when a resumable checkpoint finishes, its resume
+hook runs after the final pause is released.
+
 ### Triggering and waiting via `/proc/gvisor/checkpoint`
 
 The `/proc/gvisor/checkpoint` file is the workload's interface to the
@@ -332,8 +337,9 @@ following protocol:
 2.  **Write** `1` (or `1\n`, so `echo 1` works) to trigger a checkpoint. Writing
     requires `dev.gvisor.internal.checkpoint.enable=true`. Writing is optional —
     a process can simply read the file to passively wait for a checkpoint
-    triggered by some other process. Triggering a second save by writing to the
-    same file will fail with `ENXIO`.
+    triggered by some other process. After the first save completes, triggering
+    a second save by writing to the same file will fail with `ENXIO`. A write
+    during an active checkpoint can fail with `EBUSY` instead.
 3.  **Read** the file. The read blocks until the checkpoint completes and then
     returns one of the following lines:
     -   `resume` — the checkpoint completed and the original workload has

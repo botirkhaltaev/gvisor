@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -36,6 +37,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cleanup"
+	"gvisor.dev/gvisor/pkg/control/client"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
@@ -48,6 +50,388 @@ import (
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+// TestCheckpointPreparationCleanup verifies that a resumable checkpoint undoes
+// its hooks and lets the application checkpoint again, even after a write
+// failure. A user-requested pause defers cleanup until resume.
+func TestCheckpointPreparationCleanup(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		pauseBeforeSave    bool
+		pauseDuringSave    bool
+		resumeDuringSave   bool
+		lifecyclePause     bool
+		saveSucceeds       bool
+		failWithoutNewHook bool
+	}{
+		{name: "ImmediateHookCleanup"},
+		{name: "DeferredHookCleanup", pauseDuringSave: true},
+		{name: "ResumeDuringSave", pauseDuringSave: true, resumeDuringSave: true},
+		{name: "LifecyclePause", pauseDuringSave: true, lifecyclePause: true},
+		{name: "SuccessfulPausedCheckpoint", pauseDuringSave: true, saveSucceeds: true},
+		{name: "PausedHooklessCheckpoint", pauseBeforeSave: true, failWithoutNewHook: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := makeTempDir(t, "checkpoint-write-failure")
+			hookLog := filepath.Join(dir, "hook.log")
+			hookPath := filepath.Join(dir, "hook.sh")
+			hook := fmt.Sprintf("#!/bin/sh\necho ${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE} >> %q\n", hookLog)
+			if err := os.WriteFile(hookPath, []byte(hook), 0777); err != nil {
+				t.Fatalf("writing save/restore hook: %v", err)
+			}
+
+			spec, conf := sleepSpecConf(t)
+			cont := startContainer(t, conf, spec, setupBundle(t, conf, spec), nil)
+			checkpointOpts := sandbox.CheckpointOpts{
+				Resume:                     true,
+				SaveRestoreExecArgv:        hookPath,
+				SaveRestoreExecTimeout:     controlapi.DefaultSaveRestoreExecTimeout,
+				SaveRestoreExecContainerID: cont.ID,
+			}
+			if test.lifecyclePause {
+				checkpointOpts.SaveRestoreExecTimeout = 5 * time.Second
+			}
+			const hookedSave = "save\nresume\n"
+			checkHookLog := func(want string) {
+				t.Helper()
+				if got, err := os.ReadFile(hookLog); err != nil || string(got) != want {
+					t.Fatalf("save/restore hook invocations: got %q (err %v), want %q", got, err, want)
+				}
+			}
+			waitForHookLog := func(want string) {
+				t.Helper()
+				if err := testutil.Poll(func() error {
+					got, err := os.ReadFile(hookLog)
+					if err != nil {
+						return err
+					}
+					if string(got) != want {
+						return fmt.Errorf("save/restore hook invocations: got %q, want %q", got, want)
+					}
+					return nil
+				}, 30*time.Second); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if test.pauseBeforeSave {
+				if err := cont.Checkpoint(conf, makeTempDir(t, "initial-checkpoint"), checkpointOpts); err != nil {
+					t.Fatalf("initial checkpoint failed: %v", err)
+				}
+				waitForHookLog(hookedSave)
+				if err := cont.Pause(); err != nil {
+					t.Fatalf("pausing before failed checkpoint: %v", err)
+				}
+			}
+
+			saveOpts := &controlapi.SaveOpts{Resume: true}
+			if test.failWithoutNewHook {
+				// A configured helper does not require cleanup without CUDA processes.
+				saveOpts.CudaCheckpointPath = "/bin/false"
+			} else {
+				saveOpts.ExecOpts = controlapi.SaveRestoreExecOpts{
+					Argv:        checkpointOpts.SaveRestoreExecArgv,
+					Timeout:     checkpointOpts.SaveRestoreExecTimeout,
+					ContainerID: checkpointOpts.SaveRestoreExecContainerID,
+				}
+			}
+
+			// Open the control socket through /proc/self/fd to avoid the Unix
+			// socket path length limit.
+			socketFile, err := os.OpenFile(cont.Sandbox.GetControlSocketPath(), unix.O_PATH, 0)
+			if err != nil {
+				t.Fatalf("opening sandbox control socket: %v", err)
+			}
+			defer socketFile.Close()
+			ctrlClient, err := client.ConnectTo(fmt.Sprintf("/proc/self/fd/%d", socketFile.Fd()))
+			if err != nil {
+				t.Fatalf("connecting to sandbox control socket: %v", err)
+			}
+			defer ctrlClient.Close()
+			pause, resume := cont.Pause, cont.Resume
+			if test.lifecyclePause {
+				// The checkpoint call blocks its connection, so Lifecycle calls need
+				// another connection to run during the checkpoint.
+				lifecycleClient, err := client.ConnectTo(fmt.Sprintf("/proc/self/fd/%d", socketFile.Fd()))
+				if err != nil {
+					t.Fatalf("connecting to sandbox control socket: %v", err)
+				}
+				defer lifecycleClient.Close()
+				pause = func() error { return lifecycleClient.Call("Lifecycle.Pause", nil, nil) }
+				resume = func() error { return lifecycleClient.Call("Lifecycle.Resume", nil, nil) }
+			}
+			if test.pauseDuringSave {
+				readPipe, writePipe, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer readPipe.Close()
+				defer writePipe.Close()
+				pipeSize, err := unix.FcntlInt(writePipe.Fd(), unix.F_SETPIPE_SZ, os.Getpagesize())
+				if err != nil {
+					t.Fatalf("setting checkpoint pipe capacity: %v", err)
+				}
+				// The metadata must fill the pipe before Kernel.SaveTo acquires
+				// the lock needed by Pause. Use the actual pipe capacity and
+				// allow for the byte read below.
+				saveOpts.Metadata = statefile.CompressionLevelFlateBestSpeed.ToMetadata()
+				saveOpts.Metadata["test-padding"] = strings.Repeat("x", pipeSize+2)
+				saveOpts.Files = []*os.File{writePipe}
+				result := make(chan error, 1)
+				go func() { result <- ctrlClient.Call(sentryapi.ContMgrCheckpoint, saveOpts, nil) }()
+				if err := readPipe.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				var firstByte [1]byte
+				if _, err := readPipe.Read(firstByte[:]); err != nil {
+					t.Fatalf("waiting for checkpoint write: %v", err)
+				}
+				if err := pause(); err != nil {
+					t.Fatalf("pausing during checkpoint: %v", err)
+				}
+				if test.resumeDuringSave {
+					resumed := make(chan error, 1)
+					go func() { resumed <- resume() }()
+					select {
+					case err := <-resumed:
+						if err != nil {
+							t.Fatalf("resuming during checkpoint: %v", err)
+						}
+					case <-time.After(5 * time.Second):
+						t.Fatal("resume waited for the checkpoint writer")
+					}
+					checkHookLog("save\n")
+				}
+				if test.saveSucceeds {
+					if err := writePipe.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if err := readPipe.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := io.Copy(io.Discard, readPipe); err != nil {
+						t.Fatalf("draining checkpoint pipe: %v", err)
+					}
+					if err := <-result; err != nil {
+						t.Fatalf("checkpoint while paused: %v", err)
+					}
+					err := cont.Checkpoint(conf, makeTempDir(t, "paused-retry"), checkpointOpts)
+					if err == nil || !strings.Contains(err.Error(), "previous checkpoint preparation must resume") {
+						t.Fatalf("checkpoint before deferred cleanup: got %v, want pending cleanup", err)
+					}
+				} else {
+					if err := readPipe.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if err := <-result; err == nil || !strings.Contains(err.Error(), "broken pipe") {
+						t.Fatalf("checkpoint after closing reader: got %v, want a write failure", err)
+					}
+				}
+				if !test.resumeDuringSave {
+					checkHookLog("save\n")
+				}
+			} else {
+				devFull, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatalf("opening /dev/full: %v", err)
+				}
+				defer devFull.Close()
+				saveOpts.Files = []*os.File{devFull}
+				if err := ctrlClient.Call(sentryapi.ContMgrCheckpoint, saveOpts, nil); err == nil || !strings.Contains(err.Error(), "no space left on device") {
+					t.Fatalf("checkpoint with state file on /dev/full: got %v, want a write failure", err)
+				}
+			}
+
+			if test.failWithoutNewHook {
+				retryOpts := sandbox.CheckpointOpts{Resume: true, CudaCheckpointPath: saveOpts.CudaCheckpointPath}
+				if err := cont.Checkpoint(conf, makeTempDir(t, "paused-retry"), retryOpts); err != nil {
+					t.Fatalf("checkpoint retry while paused: %v", err)
+				}
+			}
+			if !test.resumeDuringSave && (test.pauseBeforeSave || test.pauseDuringSave) {
+				if err := resume(); err != nil {
+					t.Fatalf("resuming after checkpoint: %v", err)
+				}
+			}
+			checkHookLog(hookedSave)
+			if ws, err := execute(conf, cont, "/bin/true"); err != nil || ws.ExitStatus() != 0 {
+				t.Fatalf("application is not running after checkpoint: status %v, error %v", ws, err)
+			}
+
+			if err := pause(); err != nil {
+				t.Fatalf("pausing after checkpoint recovery: %v", err)
+			}
+			if err := resume(); err != nil {
+				t.Fatalf("ordinary resume after checkpoint recovery: %v", err)
+			}
+			checkHookLog(hookedSave)
+
+			if err := cont.Checkpoint(conf, makeTempDir(t, "retry-checkpoint"), checkpointOpts); err != nil {
+				t.Fatalf("checkpoint after recovery failed: %v", err)
+			}
+			wantHooks := strings.Repeat(hookedSave, 2)
+			waitForHookLog(wantHooks)
+
+			if test.failWithoutNewHook {
+				image := makeTempDir(t, "hookless-checkpoint")
+				if err := cont.Checkpoint(conf, image, sandbox.CheckpointOpts{}); err != nil {
+					t.Fatalf("checkpoint without hooks: %v", err)
+				}
+				if err := cont.Destroy(); err != nil {
+					t.Fatalf("destroying checkpointed container: %v", err)
+				}
+				restored := newContainer(t, conf, spec, setupBundle(t, conf, spec), func(args *Args) { args.ID = cont.ID })
+				if err := restored.Restore(conf, image, sandbox.DirectIOOff, false, nil); err != nil {
+					t.Fatalf("restoring hookless checkpoint: %v", err)
+				}
+				if err := restored.WaitRestore(); err != nil {
+					t.Fatalf("waiting for hookless restore: %v", err)
+				}
+				checkHookLog(wantHooks)
+			}
+		})
+	}
+}
+
+func TestCheckpointHookFSSave(t *testing.T) {
+	for _, phase := range []string{"save", "resume", "restore"} {
+		t.Run(phase, func(t *testing.T) {
+			const mount = "/checkpoint-data"
+			spec, conf := sleepSpecConf(t)
+			addTmpfsMount(spec, "checkpoint-data", makeTempDir(t, "checkpoint-data"), mount)
+			image := makeTempDir(t, "hook-fs-image")
+			spec.Annotations[sentryapi.AnnotationFSCheckpointPath] = image
+			spec.Annotations[sentryapi.AnnotationFSCheckpointPaths] = mount
+			spec.Annotations[sentryapi.AnnotationFSCheckpointPrefix+"enable"] = "true"
+			spec.Annotations[sentryapi.AnnotationFSCheckpointPrefix+"resume"] = "true"
+
+			dir := makeTempDir(t, "checkpoint-hook")
+			hookPath := filepath.Join(dir, "hook.sh")
+			resultPath := filepath.Join(dir, "result")
+			hook := fmt.Sprintf(`#!/bin/sh
+set -e
+if [ "$GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE" = %q ]; then
+  exec 3<>/proc/gvisor/fscheckpoint
+  echo 1 >&3
+  read -r result <&3
+  echo "$result" > %q
+  [ "$result" = resume ]
+fi
+`, phase, resultPath)
+			if err := os.WriteFile(hookPath, []byte(hook), 0777); err != nil {
+				t.Fatal(err)
+			}
+			cont := startContainer(t, conf, spec, setupBundle(t, conf, spec), nil)
+			fullImage := makeTempDir(t, "full-image")
+			if err := cont.Checkpoint(conf, fullImage, sandbox.CheckpointOpts{
+				Resume:                     phase != "restore",
+				SaveRestoreExecArgv:        hookPath,
+				SaveRestoreExecTimeout:     controlapi.DefaultSaveRestoreExecTimeout,
+				SaveRestoreExecContainerID: cont.ID,
+			}); err != nil {
+				t.Fatalf("full checkpoint: %v", err)
+			}
+			if phase == "restore" {
+				if err := cont.Destroy(); err != nil {
+					t.Fatalf("destroying checkpointed container: %v", err)
+				}
+				cid := cont.ID
+				image = makeTempDir(t, "restored-fs-image")
+				spec.Annotations[sentryapi.AnnotationFSCheckpointPath] = image
+				cont = newContainer(t, conf, spec, setupBundle(t, conf, spec), func(args *Args) { args.ID = cid })
+				if err := cont.Restore(conf, fullImage, sandbox.DirectIOOff, false, nil); err != nil {
+					t.Fatalf("restoring container: %v", err)
+				}
+				if err := cont.WaitRestore(); err != nil {
+					t.Fatalf("waiting for restore: %v", err)
+				}
+			}
+			var result []byte
+			if err := testutil.Poll(func() error {
+				var err error
+				result, err = os.ReadFile(resultPath)
+				if err == nil && !strings.HasSuffix(string(result), "\n") {
+					return fmt.Errorf("incomplete hook result %q", result)
+				}
+				return err
+			}, 10*time.Second); err != nil {
+				t.Fatalf("waiting for filesystem checkpoint result: %v", err)
+			}
+			if string(result) != "resume\n" {
+				t.Fatalf("filesystem checkpoint result = %q, want resume", result)
+			}
+			if info, err := os.Stat(filepath.Join(image, checkpointfiles.FSCheckpointManifestFileName)); err != nil || info.Size() == 0 {
+				t.Fatalf("missing or empty filesystem checkpoint manifest: %v", err)
+			}
+			if ws, err := execute(conf, cont, "/bin/true"); err != nil || ws.ExitStatus() != 0 {
+				t.Fatalf("application after checkpoint: status %v, error %v", ws, err)
+			}
+		})
+	}
+}
+
+func TestCheckpointHookHostFSSave(t *testing.T) {
+	const mount = "/checkpoint-data"
+	spec, conf := sleepSpecConf(t)
+	addTmpfsMount(spec, "checkpoint-data", makeTempDir(t, "checkpoint-data"), mount)
+	dir := makeTempDir(t, "host-fs-hook")
+	hookPath := filepath.Join(dir, "hook.sh")
+	hook := fmt.Sprintf(`#!/bin/sh
+set -e
+dir=%q
+phase="$GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE"
+touch "$dir/ready-$phase"
+while [ ! -e "$dir/done-$phase" ]; do sleep 0.05; done
+`, dir)
+	if err := os.WriteFile(hookPath, []byte(hook), 0777); err != nil {
+		t.Fatal(err)
+	}
+	cont := startContainer(t, conf, spec, setupBundle(t, conf, spec), nil)
+	snapshotFromHook := func(phase string) {
+		t.Helper()
+		fsImage := makeTempDir(t, "host-fs-image")
+		ready := filepath.Join(dir, "ready-"+phase)
+		if err := testutil.Poll(func() error {
+			_, err := os.Stat(ready)
+			return err
+		}, 10*time.Second); err != nil {
+			t.Errorf("waiting for %s hook: %v", phase, err)
+		} else if err := cont.FSSave(conf, fsImage, sandbox.FSSaveOpts{Paths: []string{mount}}); err != nil {
+			t.Errorf("host filesystem checkpoint during %s hook: %v", phase, err)
+		} else if info, err := os.Stat(filepath.Join(fsImage, checkpointfiles.FSCheckpointManifestFileName)); err != nil || info.Size() == 0 {
+			t.Errorf("missing or empty filesystem checkpoint manifest during %s hook: %v", phase, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "done-"+phase), nil, 0644); err != nil {
+			t.Error(err)
+		}
+	}
+
+	fullImage := makeTempDir(t, "full-image")
+	result := make(chan error, 1)
+	go func() {
+		result <- cont.Checkpoint(conf, fullImage, sandbox.CheckpointOpts{
+			SaveRestoreExecArgv:        hookPath,
+			SaveRestoreExecTimeout:     10 * time.Second,
+			SaveRestoreExecContainerID: cont.ID,
+		})
+	}()
+	snapshotFromHook("save")
+	if err := <-result; err != nil {
+		t.Fatalf("full checkpoint: %v", err)
+	}
+	if err := cont.Destroy(); err != nil {
+		t.Fatalf("destroying checkpointed container: %v", err)
+	}
+	cid := cont.ID
+	cont = newContainer(t, conf, spec, setupBundle(t, conf, spec), func(args *Args) { args.ID = cid })
+	if err := cont.Restore(conf, fullImage, sandbox.DirectIOOff, false, nil); err != nil {
+		t.Fatalf("restoring container: %v", err)
+	}
+	snapshotFromHook("restore")
+	if err := cont.WaitRestore(); err != nil {
+		t.Fatalf("waiting for restore: %v", err)
+	}
+}
 
 // TestSignalUnkillablePolicyRestore verifies that the SignalUnkillablePolicy
 // is preserved across checkpoint and restore.

@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/server"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
@@ -95,7 +96,7 @@ func (c *controller) registerHandlers() {
 	c.srv.Register(c.manager)
 	c.srv.Register(&control.Cgroups{Kernel: l.k})
 	c.srv.Register(&control.Fs{Kernel: l.k})
-	c.srv.Register(&control.Lifecycle{Kernel: l.k})
+	c.srv.Register(&Lifecycle{Lifecycle: control.Lifecycle{Kernel: l.k}, manager: c.manager})
 	c.srv.Register(&control.Logging{})
 	c.srv.Register(&control.Proc{Kernel: l.k})
 	c.srv.Register(&control.Usage{Kernel: l.k})
@@ -129,6 +130,23 @@ func (c *controller) stop() {
 	c.srv.Stop(c.stopRPCTimeout)
 }
 
+// Lifecycle preserves the Lifecycle RPC names while routing pause and resume
+// through the container manager's checkpoint bookkeeping.
+type Lifecycle struct {
+	control.Lifecycle
+	manager *containerManager
+}
+
+// Pause pauses all tasks, blocking until they are stopped.
+func (l *Lifecycle) Pause(_ *control.ContainerArgs, result *struct{}) error {
+	return l.manager.Pause(nil, result)
+}
+
+// Resume resumes all tasks.
+func (l *Lifecycle) Resume(_ *control.ContainerArgs, result *struct{}) error {
+	return l.manager.Resume(nil, result)
+}
+
 // containerManager manages sandbox containers.
 type containerManager struct {
 	// startChan is used to signal when the root container process should
@@ -152,7 +170,7 @@ type containerManager struct {
 func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 	log.Debugf("containerManager.StartRoot, cid: %s", *cid)
 	cm.l.mu.Lock()
-	state := cm.l.state
+	state := cm.l.currentState()
 	cm.l.mu.Unlock()
 	if state != created {
 		return fmt.Errorf("sandbox is not in created state, cannot start root container: state=%s", state)
@@ -212,7 +230,7 @@ func (cm *containerManager) StartSubcontainer(args *sentryapi.StartArgs, _ *stru
 		return errors.New("start argument missing container ID")
 	}
 	cm.l.mu.Lock()
-	state := cm.l.state
+	state := cm.l.currentState()
 	cm.l.mu.Unlock()
 	if state != started && state != restored {
 		if state == restoringUnstarted {
@@ -366,13 +384,24 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
 
+	cm.l.lockFullCheckpoint()
 	cm.l.mu.Lock()
 	cu := cleanup.Make(cm.l.mu.Unlock)
 	defer cu.Clean()
 
-	if cm.l.state != created {
-		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
+	if state := cm.l.currentState(); state != created {
+		cm.l.unlockFullCheckpoint()
+		return fmt.Errorf("cannot start restore in state=%s: %w", state, linuxerr.EBUSY)
 	}
+	cm.l.pauseMu.Lock()
+	if cm.l.externalPauseCount != 0 {
+		cm.l.pauseMu.Unlock()
+		cm.l.unlockFullCheckpoint()
+		return errors.New("cannot restore a paused sandbox")
+	}
+	cm.l.setStateLocked(restoringSetup)
+	cm.l.pauseMu.Unlock()
+	cm.l.unlockFullCheckpoint()
 	defer func() {
 		if retErr != nil {
 			cu.Clean() // Release `cm.l.mu` as onRestoreFailed will acquire it.
@@ -448,7 +477,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 	stateFile = nil
 	timer.Reached("created statefile reader")
 
-	cm.l.state = restoringUnstarted
+	cm.l.setStateLocked(restoringUnstarted)
 
 	// Release `cm.l.mu`.
 	cu.Clean()
@@ -600,8 +629,8 @@ func getRestoreReadersForCheckpointGofer(o *sentryapi.RestoreOpts) (io.ReadClose
 func (cm *containerManager) onRestoreFailed(err error) {
 	cm.l.lifecycleCPUs.releaseForRestore()
 	cm.l.mu.Lock()
-	cm.l.state = restoreFailed
 	cm.l.restoreErr = err
+	cm.l.setStateLocked(restoreFailed)
 	cm.l.mu.Unlock()
 	cm.l.restoreDone.Broadcast()
 	cm.restorer = nil
@@ -609,8 +638,12 @@ func (cm *containerManager) onRestoreFailed(err error) {
 
 func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
 	cm.l.mu.Lock()
-	cm.l.state = restored
+	if cm.l.currentState() == restoreFailed {
+		cm.l.mu.Unlock()
+		return
+	}
 	cm.l.savings = s
+	cm.l.setStateLocked(restored)
 	cm.l.mu.Unlock()
 	cm.l.restoreDone.Broadcast()
 	cm.restorer = nil
@@ -620,7 +653,7 @@ func (cm *containerManager) onRestoreDone(s sentryapi.Savings) {
 func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply *sentryapi.RestoreReply) (retErr error) {
 	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
 	cm.l.mu.Lock()
-	state := cm.l.state
+	state := cm.l.currentState()
 	cm.l.mu.Unlock()
 	if state != restoringUnstarted {
 		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer: state=%s", state)
@@ -708,14 +741,39 @@ func (cm *containerManager) RestoreSubcontainer(args *sentryapi.StartArgs, reply
 
 // Pause pauses all tasks, blocking until they are stopped.
 func (cm *containerManager) Pause(_, _ *struct{}) error {
-	cm.l.k.Pause()
+	l := cm.l
+	l.pauseMu.Lock()
+	defer l.pauseMu.Unlock()
+	if l.currentState().blocksCheckpoint() {
+		return fmt.Errorf("cannot pause a sandbox during restore: %w", linuxerr.EBUSY)
+	}
+	if l.k.TaskSet().IsExiting() {
+		return fmt.Errorf("cannot pause an exiting sandbox: %w", linuxerr.ESRCH)
+	}
+	l.k.Pause()
+	l.externalPauseCount++
 	return nil
 }
 
 // Resume resumes all tasks.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
-	cm.l.k.Unpause()
-	return control.PostResume(cm.l.k, nil)
+	l := cm.l
+	l.pauseMu.Lock()
+	if l.externalPauseCount == 0 {
+		l.pauseMu.Unlock()
+		return errors.New("container is not paused")
+	}
+	l.k.Unpause()
+	l.externalPauseCount--
+	cleanupPending := l.externalPauseCount == 0 && control.SaveStage(l.checkpointResumeStage.Load()) != control.SaveUnprepared
+	l.pauseMu.Unlock()
+	if !cleanupPending {
+		return nil
+	}
+	l.lockFullCheckpoint()
+	defer l.unlockFullCheckpoint()
+	defer l.stopIfKilled()
+	return l.runPostResume()
 }
 
 // Wait waits for the init process in the given container.
@@ -951,6 +1009,11 @@ func (cm *containerManager) ContainerRuntimeState(cid *string, state *sentryapi.
 //
 // +checklocksexclude:cm.l.k.fsSaveMu
 func (cm *containerManager) FSSave(args *sentryapi.FSSaveArgs, _ *struct{}) error {
+	cm.l.fsSaveMu.RLock()
+	defer cm.l.fsSaveMu.RUnlock()
+	if cm.l.currentState().blocksFSSave() {
+		return fmt.Errorf("sandbox restore is in progress: %w", linuxerr.EBUSY)
+	}
 	log.Debugf("containerManager.FSSave")
 	kopts, err := convertToKernelFSSaveOpts(args)
 	if err != nil {
@@ -980,9 +1043,10 @@ func (cm *containerManager) SetNetworkArgs(args *sentryapi.CreateLinksAndRoutesA
 	}
 
 	cm.l.mu.Lock()
-	state := cm.l.state
+	state := cm.l.currentState()
 	cm.l.mu.Unlock()
-	if state == started || state == restored || state == restoringStarted {
+	switch state {
+	case started, restoringStarted, restoringHook, restoringReady, restored:
 		log.Warningf("SetNetworkArgs called after sandbox started (state=%s), ignoring", state)
 		return nil
 	}

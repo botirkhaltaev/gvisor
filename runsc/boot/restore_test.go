@@ -15,9 +15,137 @@
 package boot
 
 import (
+	"errors"
 	"math"
+	"os"
 	"testing"
+	"testing/synctest"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 )
+
+func TestSaveAsyncDuringRestoreSetup(t *testing.T) {
+	l := &Loader{k: &kernel.Kernel{}, state: atomicbitops.FromUint32(uint32(restoringSetup))}
+	if err := l.SaveAsync(); err != linuxerr.EBUSY {
+		t.Fatalf("SaveAsync() error = %v, want %v", err, linuxerr.EBUSY)
+	}
+}
+
+func TestGuestFSSaveDuringFullCheckpoint(t *testing.T) {
+	l := &Loader{state: atomicbitops.FromUint32(uint32(started))}
+	l.lockFullCheckpoint()
+	defer l.unlockFullCheckpoint()
+	if err := l.FSSave(); !errors.Is(err, linuxerr.EBUSY) {
+		t.Fatalf("FSSave() during a full checkpoint outside an application hook = %v, want %v", err, linuxerr.EBUSY)
+	}
+}
+
+func TestSaveAsyncReportsConversionFailure(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "checkpoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	// An uncompressed checkpoint requires all three state and page files.
+	files, err := fd.NewFromFiles([]*os.File{file, file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		defer file.Close()
+	}
+
+	synctest.Test(t, func(t *testing.T) {
+		l := &Loader{
+			k:       &kernel.Kernel{},
+			root:    containerInfo{spec: &specs.Spec{}},
+			saveFDs: files,
+			state:   atomicbitops.FromUint32(uint32(started)),
+		}
+		if err := l.SaveAsync(); err != nil {
+			t.Fatalf("SaveAsync() failed to start: %v", err)
+		}
+		synctest.Wait()
+		if got := l.k.CheckpointGen().Count; got != 1 {
+			t.Errorf("checkpoint completed %d times, want 1", got)
+		}
+		// A completion notification can wake the guest before the checkpoint
+		// locks are released. Its one-shot output files are already gone.
+		l.lockFullCheckpoint()
+		err := l.SaveAsync()
+		l.unlockFullCheckpoint()
+		if err != linuxerr.ENXIO {
+			t.Errorf("SaveAsync() after notification while checkpoint locks are held = %v, want %v", err, linuxerr.ENXIO)
+		}
+		if err := l.SaveAsync(); err != linuxerr.ENXIO {
+			t.Errorf("second SaveAsync() error = %v, want %v", err, linuxerr.ENXIO)
+		}
+		if got := l.k.CheckpointGen().Count; got != 1 {
+			t.Errorf("checkpoint completion count after retries = %d, want 1", got)
+		}
+	})
+}
+
+func TestSaveConversionFailureNotification(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		state         loaderState
+		pending       bool
+		wantBusy      bool
+		wantGenerated uint32
+	}{
+		{
+			name:          "AdmittedCheckpoint",
+			state:         started,
+			wantGenerated: 1,
+		},
+		{
+			name:     "RestoreHookInProgress",
+			state:    restoringHook,
+			wantBusy: true,
+		},
+		{
+			name:          "BackgroundPagesLoading",
+			state:         restoringReady,
+			wantGenerated: 1,
+		},
+		{
+			name:          "PendingCheckpointCleanup",
+			state:         started,
+			pending:       true,
+			wantBusy:      true,
+			wantGenerated: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := &kernel.Kernel{}
+			l := &Loader{k: k, state: atomicbitops.FromUint32(uint32(tc.state))}
+			if tc.pending {
+				l.checkpointResumeStage.Store(uint32(control.SaveExecPrepared))
+			}
+
+			// The admitted case has no output file, so conversion fails
+			// before checkpoint preparation starts.
+			err := l.save(&controlapi.SaveOpts{})
+			if gotBusy := errors.Is(err, linuxerr.EBUSY); gotBusy != tc.wantBusy {
+				t.Fatalf("save() error = %v, EBUSY = %t, want EBUSY = %t", err, gotBusy, tc.wantBusy)
+			}
+			if err == nil {
+				t.Fatal("save() succeeded without an output file")
+			}
+			if got := k.CheckpointGen().Count; got != tc.wantGenerated {
+				t.Errorf("checkpoint generation = %d, want %d", got, tc.wantGenerated)
+			}
+		})
+	}
+}
 
 func TestTSCOffsetFromSnapshot(t *testing.T) {
 	const (

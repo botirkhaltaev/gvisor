@@ -163,7 +163,7 @@ type containerInfo struct {
 	useCPUNums bool
 }
 
-type loaderState int
+type loaderState uint32
 
 const (
 	// created indicates that the Loader has been created, but not started yet.
@@ -171,12 +171,21 @@ const (
 	// started indicates that the Loader has been started. This means that the
 	// root container is running. Subsequent containers may still be unstarted.
 	started
+	// restoringSetup indicates that restore owns the loader and is opening
+	// the checkpoint.
+	restoringSetup
 	// restoringUnstarted indicates that the Loader has been created and is
 	// restoring containers, but not started yet.
 	restoringUnstarted
-	// restoringStarted indicates that the Loader has been created and started
-	// along with all containers, while restore continues in the background.
+	// restoringStarted indicates that the restored kernel is running and
+	// post-restore work has exclusive access for device preparation.
 	restoringStarted
+	// restoringHook allows filesystem checkpoints while the restored
+	// application's hook runs.
+	restoringHook
+	// restoringReady allows checkpoints and OCI pause while background
+	// page loading finishes.
+	restoringReady
 	// restoreFailed indicates that the Loader has failed to restore.
 	restoreFailed
 	// restored indicates that the Loader has been fully restored.
@@ -190,10 +199,16 @@ func (s loaderState) String() string {
 		return "created"
 	case started:
 		return "started"
+	case restoringSetup:
+		return "restoringSetup"
 	case restoringUnstarted:
 		return "restoringUnstarted"
 	case restoringStarted:
 		return "restoringStarted"
+	case restoringHook:
+		return "restoringHook"
+	case restoringReady:
+		return "restoringReady"
 	case restoreFailed:
 		return "restoreFailed"
 	case restored:
@@ -201,6 +216,32 @@ func (s loaderState) String() string {
 	default:
 		return fmt.Sprintf("unknown(%d)", s)
 	}
+}
+
+func (s loaderState) restoreInProgress() bool {
+	switch s {
+	case restoringSetup, restoringUnstarted, restoringStarted, restoringHook, restoringReady:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s loaderState) blocksCheckpoint() bool {
+	return s == restoreFailed || (s.restoreInProgress() && s != restoringReady)
+}
+
+func (s loaderState) blocksFSSave() bool {
+	return s != restoringHook && s.blocksCheckpoint()
+}
+
+func (l *Loader) currentState() loaderState {
+	return loaderState(l.state.Load())
+}
+
+// +checklocks:l.mu
+func (l *Loader) setStateLocked(state loaderState) {
+	l.state.Store(uint32(state))
 }
 
 // Loader keeps state needed to start the kernel and run the container.
@@ -279,21 +320,42 @@ type Loader struct {
 	// freeOSMemory is runtimedebug.FreeOSMemory, replaced in tests.
 	freeOSMemory func()
 
-	// saveMu serializes save operations. Saves can be requested concurrently:
+	// saveMu serializes full checkpoints and their post-resume cleanup. Saves
+	// can be requested concurrently:
 	// autosave in save-resume mode is triggered by any task executing the
 	// trigger syscall, and checkpoints may be requested concurrently via the
 	// control API. Overlapping saves race: post-save cleanup
 	// (Kernel.BeforeResume) runs outside Kernel.extMu, so save N's cleanup can
 	// clear state that save N+1's in-progress Kernel.SaveTo has just set up.
 	//
-	// Lock order: saveMu is taken before mu.
-	saveMu sync.Mutex
+	// Lock order: saveMu is taken before fsSaveMu, mu, and pauseMu.
+	saveMu sync.CrossGoroutineMutex
 
-	// mu guards the fields below.
+	// fsSaveMu excludes filesystem checkpoints during full checkpoint work and
+	// admission to restore. Filesystem checkpoints hold it for reading; their
+	// writes serialize under Kernel.extMu. Application hooks release it.
+	fsSaveMu sync.CrossGoroutineRWMutex
+
+	// checkpointResumeStage is the last preparation stage awaiting undo after
+	// the state save finishes. saveMu serializes undo; Resume also reads this
+	// under pauseMu to leave in-progress state writes undisturbed.
+	checkpointResumeStage atomicbitops.Uint32
+
+	// pauseMu serializes user-requested pause transitions with the decision to
+	// start post-resume cleanup.
+	pauseMu sync.Mutex
+
+	// externalPauseCount is the number of outstanding control API pauses.
+	//
+	// +checklocks:pauseMu
+	externalPauseCount int
+
+	// State changes hold mu. Pause reads it under pauseMu, which also
+	// serializes Pause with entry into restore.
+	state atomicbitops.Uint32
+
+	// mu guards the fields below and serializes state changes.
 	mu sync.Mutex
-
-	// +checklocks:mu
-	state loaderState
 
 	// sharedMounts holds VFS mounts that may be shared between containers within
 	// the same pod. It is mapped by mount source.
@@ -1454,7 +1516,7 @@ func (l *Loader) run() error {
 		return fmt.Errorf("trying to start deleted container %q", l.sandboxID)
 	}
 
-	switch l.state {
+	switch state := l.currentState(); state {
 	case created:
 		if l.root.conf.ProfileEnable {
 			pprof.Initialize()
@@ -1515,7 +1577,7 @@ func (l *Loader) run() error {
 	case restoringUnstarted:
 		// If we are restoring, we do not want to create a process.
 	default:
-		return fmt.Errorf("Loader.Run() called in unexpected state=%s", l.state)
+		return fmt.Errorf("Loader.Run() called in unexpected state=%s", state)
 	}
 
 	if !l.noRootContainer.enabled {
@@ -1579,16 +1641,16 @@ func (l *Loader) run() error {
 	l.startupTimer.Reached("kernel started")
 	l.root.procArgs.StartupTimeline.End()
 	l.root.procArgs.StartupTimeline = nil
-	switch l.state {
+	switch state := l.currentState(); state {
 	case created:
-		l.state = started
+		l.setStateLocked(started)
 		l.releaseStartupHeapWhenIdle()
 	case restoringUnstarted:
 		// A restored sandbox releases its startup heap once the restore is
 		// complete, in containerManager.onRestoreDone.
-		l.state = restoringStarted
+		l.setStateLocked(restoringStarted)
 	default:
-		panic(fmt.Sprintf("state=%s in Loader.run() should be impossible", l.state))
+		panic(fmt.Sprintf("state=%s in Loader.run() should be impossible", state))
 	}
 	return nil
 }
@@ -2052,8 +2114,8 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 // +checklocksexclude:l.mu
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 	l.mu.Lock()
-	state := l.state
-	if state == restoringUnstarted {
+	state := l.currentState()
+	if state == restoringSetup || state == restoringUnstarted {
 		log.Infof("Waiting for the container to restore, CID: %q", cid)
 		l.restoreDone.Wait()
 		l.mu.Unlock()
@@ -2066,7 +2128,7 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 		if state != restoreFailed {
 			l.noRootContainer.waitExit()
 			l.mu.Lock()
-			state = l.state
+			state = l.currentState()
 			l.mu.Unlock()
 		}
 		*waitStatus = 0
@@ -2088,7 +2150,7 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 			// Note that state=started means the root container has been started,
 			// but other containers may not have started yet.
 			return fmt.Errorf("container %q not started", cid)
-		case restoringStarted, restored:
+		case restoringStarted, restoringHook, restoringReady, restored:
 			// The container has restored, we *should* have found the init process...
 			return fmt.Errorf("could not find init process of restored container %q in state %q", cid, state)
 		case restoreFailed:
@@ -2097,7 +2159,7 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 			log.Warningf("Restore failed, returning from waitContainer with non-zero exit status")
 			*waitStatus = 1
 			return nil
-		case restoringUnstarted:
+		case restoringSetup, restoringUnstarted:
 			panic("impossible")
 		default:
 			panic(fmt.Sprintf("Invalid state: %s", state))
@@ -2123,11 +2185,12 @@ func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
 func (l *Loader) waitRestore() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.state == restored || l.state == restoreFailed {
+	state := l.currentState()
+	if state == restored || state == restoreFailed {
 		return l.restoreErr
 	}
-	if l.state != restoringUnstarted && l.state != restoringStarted {
-		return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", l.state)
+	if !state.restoreInProgress() {
+		return fmt.Errorf("sandbox is not being restored, cannot wait for restore: state=%s", state)
 	}
 	log.Infof("Waiting for the sandbox to restore")
 	l.restoreDone.Wait()
@@ -2852,7 +2915,7 @@ func (l *Loader) containerRuntimeState(cid string) sentryapi.ContainerRuntimeSta
 		return sentryapi.RuntimeStateStopped
 	}
 	if exec.tg == nil {
-		if l.state == restoreFailed {
+		if l.currentState() == restoreFailed {
 			return sentryapi.RuntimeStateStopped
 		}
 		if _, ok := l.failedToStart[cid]; ok {

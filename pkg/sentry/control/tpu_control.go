@@ -48,53 +48,66 @@ type tpuTaskInfo struct {
 	rspReadFd  int32
 }
 
-func preSaveTPU(k *kernel.Kernel) error {
+func preSaveTPU(k *kernel.Kernel) (SaveStage, error) {
 	tpuTasks := findTPUTasks(k)
 	if len(tpuTasks) == 0 {
-		return nil
+		return SaveUnprepared, nil
 	}
+	preparedTasks, controlErr := controlTPUTasks(k, tpu_pb.ControlAction_ACTION_CHECKPOINT, tpuTasks)
 
-	var tasks []*kernel.Task
-	for _, info := range tpuTasks {
+	// Roll back only acknowledged checkpoints. If a reply was lost or timed
+	// out, a later restore request could mistake a late reply for its own.
+	tasks := make([]*kernel.Task, 0, len(preparedTasks))
+	for _, info := range preparedTasks {
 		tasks = append(tasks, info.task)
 	}
-	k.AddStateToCheckpoint(tpuTasksStateKey, tasks)
-
-	if err := controlTPUTasks(k, tpu_pb.ControlAction_ACTION_CHECKPOINT, tpuTasks); err != nil {
-		return fmt.Errorf("TPU checkpoint failed: %w", err)
+	stage := SaveUnprepared
+	if len(tasks) != 0 {
+		k.AddStateToCheckpoint(tpuTasksStateKey, tasks)
+		stage = SaveTPUPrepared
 	}
-	return nil
+	if controlErr != nil {
+		return stage, fmt.Errorf("TPU checkpoint failed: %w", controlErr)
+	}
+	return stage, nil
 }
 
 func postRestoreTPU(k *kernel.Kernel) error {
-	return postResumeTPU(k)
+	return restoreTPUTasks(k, true /* discover */)
 }
 
 func postResumeTPU(k *kernel.Kernel) error {
+	return restoreTPUTasks(k, false /* discover */)
+}
+
+func restoreTPUTasks(k *kernel.Kernel, discover bool) error {
 	tpuTasksVal := k.PopCheckpointState(tpuTasksStateKey)
 	var tpuTasks []*tpuTaskInfo
+	var decodeErr error
 	if tpuTasksVal != nil {
 		tasks := tpuTasksVal.([]*kernel.Task)
 		for _, t := range tasks {
 			info, err := extractTPUTaskInfo(t)
 			if err != nil {
-				log.Warningf("Failed to extract TPU task info for task %d: %v", t.ThreadID(), err)
+				err = fmt.Errorf("failed to read TPU control state for task %d: %w", t.ThreadID(), err)
+				if discover {
+					log.Warningf("%v", err)
+				} else {
+					decodeErr = errors.Join(decodeErr, err)
+				}
 				continue
 			}
 			tpuTasks = append(tpuTasks, info)
 		}
-	} else {
+	} else if discover {
+		// An older image may lack a saved task list.
 		tpuTasks = findTPUTasks(k)
 	}
 
-	if len(tpuTasks) == 0 {
-		return nil
+	if _, err := controlTPUTasks(k, tpu_pb.ControlAction_ACTION_RESTORE, tpuTasks); err != nil {
+		return errors.Join(decodeErr, fmt.Errorf("TPU restore failed: %w", err))
 	}
-
-	if err := controlTPUTasks(k, tpu_pb.ControlAction_ACTION_RESTORE, tpuTasks); err != nil {
-		return fmt.Errorf("TPU restore failed: %w", err)
-	}
-	return nil
+	return decodeErr
 }
 
 // Callers must not hold any thread-group leader's Task.mu in k.
@@ -131,56 +144,62 @@ func findTPUTasks(k *kernel.Kernel) []*tpuTaskInfo {
 	return infos
 }
 
-func controlTPUTasks(k *kernel.Kernel, action tpu_pb.ControlAction, tpuTasks []*tpuTaskInfo) error {
+func controlTPUTasks(k *kernel.Kernel, action tpu_pb.ControlAction, tpuTasks []*tpuTaskInfo) ([]*tpuTaskInfo, error) {
 	sctx := k.SupervisorContext()
 	if len(tpuTasks) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	log.Infof("Found %d TPU tasks, sending action %v", len(tpuTasks), action)
 
 	var wg sync.WaitGroup
-	var errs []error
-	var errsMu sync.Mutex
+	controlledTasks := make([]*tpuTaskInfo, len(tpuTasks))
+	errs := make([]error, len(tpuTasks))
 
-	for _, info := range tpuTasks {
+	for i, info := range tpuTasks {
 		t := info.task
 		fdTable := t.FDTable()
 		if fdTable == nil {
-			return fmt.Errorf("task %d has no FD table", t.ThreadID())
+			errs[i] = fmt.Errorf("task %d has no FD table", t.ThreadID())
+			break
 		}
 
 		reqFile, _ := fdTable.Get(info.reqWriteFd)
 		if reqFile == nil {
-			return fmt.Errorf("failed to get reqWriteFd %d for task %d", info.reqWriteFd, t.ThreadID())
+			errs[i] = fmt.Errorf("failed to get reqWriteFd %d for task %d", info.reqWriteFd, t.ThreadID())
+			break
 		}
 
 		rspFile, _ := fdTable.Get(info.rspReadFd)
 		if rspFile == nil {
 			reqFile.DecRef(sctx)
-			return fmt.Errorf("failed to get rspReadFd %d for task %d", info.rspReadFd, t.ThreadID())
+			errs[i] = fmt.Errorf("failed to get rspReadFd %d for task %d", info.rspReadFd, t.ThreadID())
+			break
 		}
 
 		wg.Add(1)
-		go func(info *tpuTaskInfo, reqFile, rspFile *vfs.FileDescription) {
+		go func(i int, info *tpuTaskInfo, reqFile, rspFile *vfs.FileDescription) {
 			defer wg.Done()
 			defer reqFile.DecRef(sctx)
 			defer rspFile.DecRef(sctx)
 
 			if err := controlTPUTask(sctx, info, action, reqFile, rspFile); err != nil {
-				errsMu.Lock()
-				errs = append(errs, err)
-				errsMu.Unlock()
+				errs[i] = err
+				return
 			}
-		}(info, reqFile, rspFile)
+			controlledTasks[i] = info
+		}(i, info, reqFile, rspFile)
 	}
 
 	wg.Wait()
 
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	successfulTasks := controlledTasks[:0]
+	for _, info := range controlledTasks {
+		if info != nil {
+			successfulTasks = append(successfulTasks, info)
+		}
 	}
-	return nil
+	return successfulTasks, errors.Join(errs...)
 }
 
 func controlTPUTask(sctx context.Context, info *tpuTaskInfo, action tpu_pb.ControlAction, reqFile, rspFile *vfs.FileDescription) error {
